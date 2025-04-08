@@ -6,6 +6,10 @@
 #include "libHh/Stack.h"  // also vec_contains()
 #include "libHh/StringOp.h"
 
+#ifdef BUILD_LIBPSC
+#include "G3dOGL/SplitRecord.h"
+#endif
+
 namespace hh {
 
 namespace {
@@ -913,5 +917,237 @@ Simplex SimplicialComplex::createSimplex(int dim, int id) {
 
   return s;
 }
+
+#ifdef BUILD_LIBPSC
+
+/* element type for the min heap */
+struct CostAndVertPair {
+  float cost;
+  int vsid;
+  int vtid;
+  float w_p0;
+  /* compare based on the cost */
+  bool operator<(const CostAndVertPair& other) const {
+    return cost > other.cost;  // let the smallest cost to be on top
+  }
+};
+
+/* perform simplicial complex simplification, until a single vertex */
+std::tuple<std::array<float, 3>, std::vector<py::dict>> SimplicialComplex::perform_simplification() {
+  // compute quadric for each simplex
+  for (int d : {0, 1, 2}) {
+    for (auto s : ordered_simplices_dim(d)) {
+      s->compute_native_quadric_();
+    }
+  }
+
+  // aggregate into the vertices
+  for (auto v : ordered_simplices_dim(0)) {
+    v->aggregate_();
+  }
+
+  // the priority queue, need to call "std::make_heap" to maintain the priority
+  std::vector<CostAndVertPair> pq;
+
+  // compute all possible candidate pairs for contraction
+  auto candidate_pairs = compute_candidate_pairs();
+
+  // compute the cost for each candidate pair, and insert into the priority queue
+  for (auto [v0, v1] : candidate_pairs) {
+    auto [cost, w_p0] = compute_contraction_cost_and_location(v0, v1);
+    //
+    int vsid, vtid;
+    if (w_p0 == 0.0f) {
+      // (v0, v1) --> v1
+      // "v1" is source
+      vsid = v1;
+      vtid = v0;
+    } else {
+      // (v0, v1) --> v0
+      // "v0" is source
+      //     or
+      // (v0, v1) --> mid
+      vsid = v0;
+      vtid = v1;
+    }
+    // note : "v0" and "v1" are sorted, not stand for "vsid" and "vtid" respectively
+    pq.push_back({.cost = cost, .vsid = vsid, .vtid = vtid, .w_p0 = w_p0});
+  }
+  std::make_heap(pq.begin(), pq.end());
+
+  // all the edge collapse recordings
+  std::vector<EcolRecord> ecol_record_lst;
+
+  // for loop, until only one vertex left
+  while (!pq.empty()) {
+    // get the candidate with the lowest cost
+    auto [cost, vsid, vtid, w_p0] = pq[0];
+
+    // record the collapse step
+    auto ecol_record = compute_ecol_record(vsid, vtid, w_p0);
+    ecol_record_lst.push_back(ecol_record);
+
+    Simplex vs = getSimplex(0, vsid);
+    Simplex vt = getSimplex(0, vtid);
+
+    // update source position, because we will later unify and discard "vt"
+    vs->setPosition(vt->getPosition() - ecol_record.delta_p);
+    vs->_component_id = vt->_component_id;
+
+    // unify the two vertices (do not destroy "v1")
+    unify(vs, vt);
+
+    // replace "vt" with "vs" in candidate pairs
+    for (auto& [_cost, _vsid, _vtid, _w_p0] : pq) {
+      if (_vsid == vtid) {
+        _vsid = vsid;
+      }
+      if (_vtid == vtid) {
+        _vtid = vsid;
+      }
+    }
+
+    // remove degenerated cases (two endpoints are overlapped) from the candidate pairs
+    pq.erase(std::remove_if(pq.begin(), pq.end(), [](const auto& a) { return a.vsid == a.vtid; }), pq.end());
+
+    // remove duplicates
+    //   after replacement, (vs, p) and (vt, p) become two (vs, p), which is duplicated
+    std::sort(pq.begin(), pq.end(), [](const auto& a, const auto& b) {
+      return std::make_tuple(a.vsid, a.vtid) < std::make_tuple(b.vsid, b.vtid);
+    });
+    pq.erase(std::unique(pq.begin(), pq.end(),
+                         [](const auto& a, const auto& b) { return a.vsid == b.vsid && a.vtid == b.vtid; }),
+             pq.end());
+
+    // re-compute the cost
+    for (auto& [_cost, _vsid, _vtid, _w_p0] : pq) {
+      // update the cost if:
+      //   it is related to "vs"
+      if (_vsid == vsid || _vtid == vsid) {
+        std::tie(_cost, _w_p0) = compute_contraction_cost_and_location(_vsid, _vtid);
+      }
+    }
+
+    // make priority
+    std::make_heap(pq.begin(), pq.end());
+  }
+
+  // check the simplices' number
+  //   vertices have not been fully removed (because we need to access "getId()" before)
+  //   but edges/faces are completely removed
+  assertx(num(0) == 1 && num(1) == 0 && num(2) == 0);
+
+  // reverse the collapse operations
+  std::reverse(ecol_record_lst.begin(), ecol_record_lst.end());
+
+  // create the vertex id remapping table
+  std::unordered_map<int, int> remap;  // old vert id --> increasing vert id
+  int vert_idx_inc = 1;                // >= 1
+  for (const auto& record : ecol_record_lst) {
+    // if insertion is new, then vertex id increases
+    vert_idx_inc += int(std::get<1>(remap.emplace(record.vsid, vert_idx_inc)));
+    vert_idx_inc += int(std::get<1>(remap.emplace(record.vtid, vert_idx_inc)));
+  }
+
+  // the vertex id of the starting point
+  int start_v_idx = ecol_record_lst[0].vsid;
+
+  // remap the vertex index
+  for (auto& [vsid, vtid, position_bit, delta_p, topo_record] : ecol_record_lst) {
+    // apply "remap" and update vertex ids
+    vsid = remap.at(vsid);
+    vtid = remap.at(vtid);
+
+    // apply "remap" and update "topo_record"
+    constexpr int INT_MAX_VAL = std::numeric_limits<int>::max();
+    for (auto& [defining_vertex_ids, label] : topo_record) {
+      for (auto& v : defining_vertex_ids) {
+        if (v != INT_MAX_VAL) {
+          v = remap.at(v);
+        }
+      }
+      std::sort(defining_vertex_ids.begin(), defining_vertex_ids.end());
+    }
+  }
+
+  // the starting location
+  Point starting_point_ = getSimplex(0, start_v_idx)->getPosition();
+  std::array<float, 3> starting_point{starting_point_[0], starting_point_[1], starting_point_[2]};
+
+  // compute string code by reconstructing the simplicial complex
+  SimplicialComplex K_recon;
+  std::stringstream ss;
+  ss << "Simplex 0 1 " << starting_point[0] << " " << starting_point[1] << " " << starting_point[2] << "\n";
+  K_recon.read(ss);
+
+  // the output list for vertex splitting operations
+  std::vector<py::dict> vsplit_lst;
+
+  // compute the string code during reconstruction of the simplicial complex
+  //   this is because :
+  //     we have reordered the vertices, making them starting from 1 and increasing during vertex splitting
+  //     the simplex order of the string code really matters
+  //     we need to reconstruct to obtain the order
+  //     and use the order to compute string code
+  for (const auto& ecol_record : ecol_record_lst) {
+    const auto& [vsid, vtid, position_bit, delta_p, topo_record_lst] = ecol_record;
+
+    Simplex vs = assertx(K_recon.getSimplex(0, vsid));
+
+    // compute the ordered queue of adjacent simplices
+    Pqueue<Simplex> pq[3];
+    for (auto s : vs->get_star()) {
+      pq[s->getDim()].enter_unsorted(s, float(s->getId()));
+    }
+
+    // to find the topological label for the query simplex
+    auto find_label = [&](Simplex s) {
+      auto v_ids = compute_defining_vertex_ids(s);
+      for (const auto& [defining_vertex_ids, label] : topo_record_lst) {
+        if (v_ids == defining_vertex_ids) {
+          return label;  // return the topological label
+        }
+      }
+      assertnever("should never reach here");
+    };
+
+    // compute the string code
+    std::string string_code = "";
+    for (int dim : {0, 1, 2}) {
+      pq[dim].sort();
+      while (!pq[dim].empty()) {
+        Simplex s = pq[dim].remove_min();
+        if (dim == 0) {
+          assertx(s == vs);
+          string_code += std::string("9") + std::to_string(find_label(s));
+        } else if (dim == 1) {
+          string_code += std::string("8") + std::to_string(find_label(s));
+        } else {
+          assertx(dim == 2);
+          string_code += std::string("7") + std::to_string(find_label(s));
+        }
+      }
+    }
+
+    // prepare the python dict
+    vsplit_lst.push_back(ecol_record.to_dict(string_code));  // convert to python dictionary
+
+    // build the "SplitRecord" object
+    std::stringstream ss;
+    ss << vsid << " " << vtid << "\n";
+    ss << string_code << "\n";
+    ss << position_bit << " " << delta_p[0] << " " << delta_p[1] << " " << delta_p[2] << "\n";
+    ss << "-1\n-1\n";
+    SplitRecord split_record;
+    split_record.read(ss);
+
+    // apply vertex split
+    split_record.applySplit(K_recon);
+  }
+
+  // output the starting location as well as the operation sequence
+  return std::make_tuple(starting_point, vsplit_lst);
+}
+#endif
 
 }  // namespace hh
