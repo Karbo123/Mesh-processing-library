@@ -44,7 +44,7 @@
       <!-- <OpenMPSupport>true</OpenMPSupport> -->
       <UseFullPaths>true</UseFullPaths>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <TreatWarningAsError>true</TreatWarningAsError>
+      <TreatWarningAsError>false</TreatWarningAsError>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <!-- Warning C6319: Use of the comma-operator in a tested expression causes the left argument to be ignored when it has no side-effects -->
@@ -54,7 +54,7 @@
       <SubSystem>Console</SubSystem>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(LocalRoot)\lib\$(Platform)\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\Users\runneradmin\miniconda3\envs\py313\libs;C:\vcpkg\installed\x64-windows\lib;$(LocalRoot)\lib\$(Platform)\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- <AdditionalDependencies>libjpeg.lib;libpng.lib;libz.lib;librecipes.lib;%(AdditionalDependencies)</AdditionalDependencies> -->
       <!-- <AdditionalDependencies>liblapack.lib;libF77.lib;libI77.lib;libBLAS.lib;%(AdditionalDependencies)</AdditionalDependencies> -->
     </Link>

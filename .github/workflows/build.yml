@@ -1,0 +1,112 @@
+name: Build on Ubuntu and Windows
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  ubuntu-build:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo add-apt-repository ppa:deadsnakes/ppa -y
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            g++-11 \
+            gcc-11 \
+            libqhull-dev \
+            libgl1-mesa-dev \
+            libglu1-mesa-dev \
+            python3.13 \
+            python3.13-dev \
+            python3.13-venv \
+            libpython3.13-dev
+
+      - name: Install pybind11 for Python 3.13
+        run: |
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.13
+          python3.13 -m pip install --user pybind11
+
+      - name: Compile the code
+        run: |
+          make \
+            CC=gcc-11 \
+            CXX=g++-11 \
+            CONFIG=unix \
+            CXXFLAGS="-std=c++17 -DBUILD_LIBPSC -I$(python3.13 -c 'import pybind11; print(pybind11.get_include())') $(python3.13-config --includes)" \
+            LDFLAGS="$(python3.13-config --ldflags) -lpython3.13 -lqhullcpp -lqhull_r" \
+            -j$(nproc) G3dOGL
+
+      - name: Copy dependencies
+        run: |
+          cp /usr/lib/x86_64-linux-gnu/libpython3.13.so bin/unix/
+          cp /usr/lib/x86_64-linux-gnu/libqhull*.so bin/unix/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-unix
+          path: bin/unix/
+
+  windows-build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1
+
+      - name: Install vcpkg
+        shell: powershell
+        run: |
+          git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+          cd C:\vcpkg
+          .\bootstrap-vcpkg.bat
+          .\vcpkg integrate install
+          .\vcpkg install qhull:x64-windows
+
+      - name: Install Miniconda and Python 3.13
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: py313
+          auto-update-conda: true
+          python-version: "3.13"
+
+      - name: Install pybind11 via pip
+        shell: cmd
+        run: |
+          call %CONDA%\condabin\conda activate py313
+          pip install pybind11
+
+      - name: Build
+        shell: cmd
+        env:
+          CL: >
+            /I"C:\Users\runneradmin\miniconda3\envs\py313\include"
+            /I"C:\Users\runneradmin\miniconda3\envs\py313\Lib\site-packages\pybind11\include"
+            /I"C:\vcpkg\installed\x64-windows\include"
+            /I"C:\vcpkg\installed\x64-windows\include\libqhullcpp"
+            /I"C:\vcpkg\installed\x64-windows\include\libqhull_r"
+            /DBUILD_LIBPSC
+        run: |
+          MSBuild mesh_processing.sln ^
+            /p:Configuration=ReleaseMD ^
+            /p:Platform=x64 ^
+            /p:AdditionalDependencies=python313.lib ^
+            /t:G3dOGL ^
+            /m
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-win
+          path: bin/G3dOGL.exe
