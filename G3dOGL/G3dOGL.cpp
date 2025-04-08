@@ -141,6 +141,11 @@ bool noinfo;
 bool g_twosided = getenv_bool("G3D_TWOSIDED");        // no green ever
 const int g_twolights = getenv_int("G3D_TWOLIGHTS");  // 0, 1, 2
 
+float minpointradius = 0.0f;
+float minedgeradius = 0.0f;
+float usedefaultcolor = 0.0f;
+constexpr Pixel default_diffuse_color = {160, 160, 200};
+
 bool use_dl = true;
 Set<int> svalid_dl;
 bool defining_dl = false;
@@ -722,8 +727,7 @@ struct glt_format {
 };
 
 const Array<glt_format> k_glt_formats = {
-#define E(f) \
-  { f, #f }
+#define E(f) {f, #f}
     E(GL_COMPRESSED_RGB),
     E(GL_RGB16),
     E(GL_RGBA16),
@@ -884,7 +888,9 @@ void set_anisotropy() {
 
 void update_anisotropy() {
   float max_anisotropy;
-  { glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &max_anisotropy); }
+  {
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &max_anisotropy);
+  }
   anisotropy *= 2;
   if (anisotropy > max_anisotropy) anisotropy = 1;
   set_anisotropy();
@@ -2294,8 +2300,8 @@ void all_reset() {
     g_xobs.cullface[i] = true;
     g_xobs.reverse_cull[i] = false;
     g_xobs.shading[i] = true;
-    g_xobs.smooth[i] = true;
-    g_xobs.edges[i] = false;
+    g_xobs.smooth[i] = false;
+    g_xobs.edges[i] = true;
   }
   mdepthcue = false;
   antialiasing = true;
@@ -2426,7 +2432,9 @@ void GxObject::morph(float finterp) {  // finterp == 1.f is new,   finterp == 0.
   int if1 = int(finterp * 256.f), if2 = 256 - if1;
   for (Vertex v : mesh.vertices()) {
     const VertexLOD& vlod = v_lod(v);
-    { mesh.set_point(v, interp(vlod.Npos, vlod.Opos, f1)); }
+    {
+      mesh.set_point(v, interp(vlod.Npos, vlod.Opos, f1));
+    }
     if (has_only_v_color) {
       v_color(v) = interp_color(vlod.Nd, vlod.Od, if1, if2);
     } else if (has_either_color) {
@@ -2487,8 +2495,8 @@ GxObjects::GxObjects() {
     cullface[i] = true;
     reverse_cull[i] = false;
     shading[i] = true;
-    smooth[i] = true;
-    edges[i] = false;
+    smooth[i] = false;
+    edges[i] = true;
   }
 }
 
@@ -2606,6 +2614,9 @@ bool HB::init(Array<string>& aargs, bool (*pfkeyp)(const string& s),
   HH_ARGSD(texturemap, "image_filename : load texture map");
   HH_ARGSP(texturenormal, "bool : normal (not bump) map");
   HH_ARGSP(texturescale, "fac : scale texture coordinates (0=no_wrap)");
+  HH_ARGSP(minpointradius, "f : minimum point radius");
+  HH_ARGSP(minedgeradius, "f : minimum edge radius");
+  HH_ARGSP(usedefaultcolor, "f : only use gray color");
   args.p("-pm_mode", pm_filename, "file.pm : progressive mesh mode");
   args.p("-sr_mode", sr_filename, "file.pm : selective refinement");
   args.p("-sc_mode", sc_filename, "file.sc : simplicial complex mode");
@@ -4298,6 +4309,7 @@ inline float projected_area(float area, const Point& x) {
 
 void draw_point(const Point& vp, float area) {
   float sphererad = sqrt(area / (TAU * 2));
+  sphererad = max(sphererad, minpointradius);
   float prad = projected_area(sphererad, vp);
   int complexity;
   if (prad < 10) {
@@ -4307,6 +4319,7 @@ void draw_point(const Point& vp, float area) {
   } else {
     complexity = 20;
   }
+  complexity *= 2;
   render_sphere(vp, sphererad, complexity, complexity);
 }
 
@@ -4314,10 +4327,13 @@ void draw_sc() {
   if (defining_dl) Warning("Display lists should be off ('DC') if zooming in/out");
   glShadeModel(GL_SMOOTH);
   initialize_lit();
+  if (usedefaultcolor) {
+    mesh_color = {.d = default_diffuse_color, .s = Pixel{0, 0, 0}, .g = -1.0f};
+  }
   update_mat_color(mesh_color);
   if (!ledges || lshading) {
     // Options lsmooth, lquickmode not handled.
-    assertw(lsmooth);
+    // assertw(lsmooth);
     glBegin(GL_TRIANGLES);
     int i = 0;
     for (Simplex s2 : Kmesh.simplices_dim(2)) {
@@ -4325,7 +4341,7 @@ void draw_sc() {
         glEnd();
         glBegin(GL_TRIANGLES);
       }
-      maybe_update_mat_diffuse(s_color[s2->getVAttribute()]);
+      maybe_update_mat_diffuse(usedefaultcolor ? default_diffuse_color : s_color[s2->getVAttribute()]);
       Simplex v0, v1, v2;
       Vec3<Simplex> verts;
       s2->vertices(verts.data());
@@ -4335,9 +4351,12 @@ void draw_sc() {
       const Point& p0 = v0->getPosition();
       const Point& p1 = v1->getPosition();
       const Point& p2 = v2->getPosition();
-      const Vector& n0 = corner_pnor[3 * s2->getId()];
-      const Vector& n1 = corner_pnor[3 * s2->getId() + 1];
-      const Vector& n2 = corner_pnor[3 * s2->getId() + 2];
+      Vector n0 = corner_pnor[3 * s2->getId()];
+      Vector n1 = corner_pnor[3 * s2->getId() + 1];
+      Vector n2 = corner_pnor[3 * s2->getId() + 2];
+      if (!lsmooth) { // flat shading
+        n0 = n1 = n2 = fct_pnor[s2->getId()];
+      }
       glNormal3fv(n0.data());
       glVertex3fv(p0.data());
       glNormal3fv(n1.data());
@@ -4362,11 +4381,12 @@ void draw_sc() {
         float rad;
         float height = dist(vj, vk);
         rad = area / (TAU * height);
+        rad = max(rad, minedgeradius);
         // cylinder center
         const Point& center = interp(vj, vk);
         if (height < 2.f * rad) {
           // draw as point
-          maybe_update_mat_diffuse(s_color[s1->getVAttribute()]);
+          maybe_update_mat_diffuse(usedefaultcolor ? default_diffuse_color : s_color[s1->getVAttribute()]);
           draw_point(center, area);
           continue;
         }
@@ -4378,7 +4398,7 @@ void draw_sc() {
         if (thickness < 5) {
           // draw a line
           initialize_unlit();
-          update_cur_color(s_color[s1->getVAttribute()]);
+          update_cur_color(usedefaultcolor ? default_diffuse_color : s_color[s1->getVAttribute()]);
           set_thickness(thickness);
           glBegin(GL_LINES);
           glVertex3fv(vj.data());
@@ -4388,7 +4408,7 @@ void draw_sc() {
           update_mat_color(mesh_color);
         } else {
           // draw as cylinder
-          maybe_update_mat_diffuse(s_color[s1->getVAttribute()]);
+          maybe_update_mat_diffuse(usedefaultcolor ? default_diffuse_color : s_color[s1->getVAttribute()]);
           cyl.draw(vj, vk, rad);
         }
       }
@@ -4399,7 +4419,7 @@ void draw_sc() {
     for (Simplex s0 : psc_principal_verts) {
       assertx(s0->isPrincipal());
       psc_orphan_nverts++;
-      maybe_update_mat_diffuse(s_color[s0->getVAttribute()]);
+      maybe_update_mat_diffuse(usedefaultcolor ? default_diffuse_color : s_color[s0->getVAttribute()]);
       float area = s0->getArea();
       assertx(area >= 0.f);
       draw_point(s0->getPosition(), area);

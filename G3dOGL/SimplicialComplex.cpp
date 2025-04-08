@@ -6,6 +6,10 @@
 #include "libHh/Stack.h"  // also vec_contains()
 #include "libHh/StringOp.h"
 
+#ifdef BUILD_LIBPSC
+#include "G3dOGL/SplitRecord.h"
+#endif
+
 namespace hh {
 
 namespace {
@@ -325,8 +329,21 @@ bool SimplicialComplex::eq2simp(Simplex s1, Simplex s2) const {
                                         (s1verts[1] == s2verts[1] && s1verts[2] == s2verts[0]))));
 }
 
-void SimplicialComplex::unify(Simplex vs, Simplex vt, int propagate_area) {
+void SimplicialComplex::unify(Simplex vs, Simplex vt, int propagate_area, MinHeap* heap) {
   assertx(vs->getDim() == 0 && vt->getDim() == 0);
+
+  std::map<Simplex, int> modified_simplices;
+  if (heap) {
+    for (auto v : {vs, vt}) {
+      for (auto s : v->get_star()) {
+        if (s->getDim() == 0) {
+          continue;
+        }
+        assertx(s->getDim() == 1);
+        modified_simplices[s] = -1;
+      }
+    }
+  }
 
   Simplex both = vs->edgeTo(vt);
   Stack<Simplex> check_principal;
@@ -500,6 +517,32 @@ void SimplicialComplex::unify(Simplex vs, Simplex vt, int propagate_area) {
         break;
       }
     }
+  }
+
+  if (heap) {
+    for (auto s : vs->get_star()) {
+      if (s->getDim() == 0) {
+        continue;
+      }
+      assertx(s->getDim() == 1);
+      modified_simplices[s] += 1;
+    }
+
+    // update the heap
+    for (auto [e, cnt] : modified_simplices) {
+      if (cnt == 0) {
+        assertx(e->getDim() == 1);
+        continue;
+      } else if (cnt == 1) {
+        assertnever("should never add a new contraction pair");
+      } else {
+        assertx(cnt == -1);
+        // "e" have been destroyed, cannot access
+        heap->erase(e);
+      }
+    }
+
+    return;
   }
 
   dim = 2;
@@ -913,5 +956,313 @@ Simplex SimplicialComplex::createSimplex(int dim, int id) {
 
   return s;
 }
+
+#ifdef BUILD_LIBPSC
+
+/* perform simplicial complex simplification, until a single vertex */
+std::tuple<std::array<float, 3>, std::vector<py::dict>> SimplicialComplex::perform_simplification() {
+  // compute quadric for each simplex
+  for (int d : {0, 1, 2}) {
+    for (auto s : ordered_simplices_dim(d)) {
+      s->compute_native_quadric_();
+    }
+  }
+
+  // aggregate into the vertices
+  for (auto v : ordered_simplices_dim(0)) {
+    v->aggregate_();
+  }
+
+  // the min heap
+  MinHeap heap;
+
+  // compute all possible candidate pairs for contraction
+  auto candidate_pairs = compute_candidate_pairs();
+
+  // construct the candidate pairs as a simplicial complex as well
+  SimplicialComplex sc_candi_pairs;
+  for (auto [idx_v0, idx_v1] : candidate_pairs) {
+    // create the first endpoint
+    auto v0 = sc_candi_pairs.getSimplex(0, idx_v0);
+    if (v0 == nullptr) {
+      v0 = sc_candi_pairs.createSimplex(0, idx_v0);
+      v0->setPosition(getSimplex(0, idx_v0)->getPosition());
+    }
+
+    // create the second endpoint
+    auto v1 = sc_candi_pairs.getSimplex(0, idx_v1);
+    if (v1 == nullptr) {
+      v1 = sc_candi_pairs.createSimplex(0, idx_v1);
+      v1->setPosition(getSimplex(0, idx_v1)->getPosition());
+    }
+
+    // must not exist
+    assertx(v0->edgeTo(v1) == nullptr);
+    assertx(v1->edgeTo(v0) == nullptr);
+
+    // create the contraction pair
+    auto e = sc_candi_pairs.createSimplex(1);
+
+    // set the connectivity
+    e->setChild(0, v0);
+    e->setChild(1, v1);
+    v0->addParent(e);
+    v1->addParent(e);
+
+    // compute contraction cost and new location
+    std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(idx_v0, idx_v1);
+
+    // add to heap
+    assertx(heap.insert(e));
+  }
+
+  // all the edge collapse recordings
+  std::vector<EcolRecord> ecol_record_lst;
+
+  // see if this is a valid vertex unification
+  auto is_valid_ecol = [&](int vsid, int vtid, Point p_new) -> bool {
+    Simplex vs = getSimplex(0, vsid);
+    Simplex vt = getSimplex(0, vtid);
+    auto face_s = vs->faces_of_vertex();
+    auto face_t = vt->faces_of_vertex();
+    std::set<Simplex> face_set_s(face_s.begin(), face_s.end());
+    std::set<Simplex> face_set_t(face_t.begin(), face_t.end());
+
+    // symmetric difference
+    std::set<Simplex> affected_faces = [&] {
+      std::set<Simplex> result;
+      for (auto f : face_set_s)
+        if (!face_set_t.count(f)) result.insert(f);
+      for (auto f : face_set_t)
+        if (!face_set_s.count(f)) result.insert(f);
+      return result;
+    }();
+
+    // get vertex position (possibly replaced)
+    auto get_v_pos = [&](Simplex v, bool replace = true) {
+      assertx(v->getDim() == 0);
+      if (replace) {
+        int vid = v->getId();
+        if (vid == vsid || vid == vtid) {
+          return p_new;
+        }
+      }
+      return v->getPosition();
+    };
+
+    // get face normals
+    auto get_f_nor = [&](Simplex f, bool replace = true) {
+      assertx(f->getDim() == 2);
+      Simplex v012[3];
+      f->vertices(v012);
+      Point v0 = get_v_pos(v012[0], replace);
+      Point v1 = get_v_pos(v012[1], replace);
+      Point v2 = get_v_pos(v012[2], replace);
+      Point u = v1 - v0;
+      Point v = v2 - v0;
+      Point normals = cross(u, v);
+      normals.normalize();
+      return normals;
+    };
+
+    // compute original face normals
+    for (Simplex f : affected_faces) {
+      Point nor_before = get_f_nor(f, false);
+      Point nor_after = get_f_nor(f, true);
+      // detect flipped faces
+      //   the threshold is from: https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification/blob/65df07dc54766e3ee480482f1c881a62767831cc/src.gl/Simplify.h#L219
+      if (dot(nor_before, nor_after) < 0.2f) {
+        return false;
+      }
+    }
+
+    // TODO
+    //   detect self-intersection
+    //   but we may never implement it, because the original input mesh may already contain self-intersection
+
+    return true;
+  };
+
+  // for loop, until only one vertex left
+  while (!heap.empty()) {
+    // get the candidate with the lowest cost
+    Simplex pair = heap.min();
+    assertx(pair->getDim() == 1);
+
+    // get the values
+    float cost = pair->cost;
+    int vsid = pair->getChild(0)->getId();
+    int vtid = pair->getChild(1)->getId();
+    float w_p0 = pair->w_p0;
+    if (w_p0 == 0.0f) {
+      std::swap(vsid, vtid);
+    }
+
+    Simplex vs = getSimplex(0, vsid);
+    Simplex vt = getSimplex(0, vtid);
+
+    // compute new location
+    Point delta_p = vt->getPosition() - vs->getPosition();
+    if (w_p0 == 0.5f) {
+      delta_p *= 0.5f;
+    }
+    Point p_new = vt->getPosition() - delta_p;
+
+    // see if it will cause flipped faces
+    constexpr float FP32_INF = std::numeric_limits<float>::max();
+    if (cost < FP32_INF && !is_valid_ecol(vsid, vtid, p_new)) {
+      assertx(heap.erase(pair));
+      pair->cost = FP32_INF;  // penalize such a collapse
+      assertx(heap.insert(pair));
+      continue;
+    }
+
+    // record the collapse step
+    auto ecol_record = compute_ecol_record(vsid, vtid, w_p0);
+    ecol_record_lst.push_back(ecol_record);
+
+    // update source position, because we will later unify and discard "vt"
+    vs->setPosition(p_new);
+    vs->_component_id = vt->_component_id;
+    ISimplex::add_quadric_(vs, vt);
+
+    // unify the two vertices (do not destroy "v1")
+    unify(vs, vt);
+
+    // the sc of candidate pairs
+    sc_candi_pairs.unify(sc_candi_pairs.getSimplex(0, vsid), sc_candi_pairs.getSimplex(0, vtid), 0, &heap);
+
+    // re-compute the cost
+    for (auto e : sc_candi_pairs.getSimplex(0, vsid)->get_star()) {
+      if (e->getDim() == 0) continue;
+      assertx(e->getDim() == 1);
+      // update
+      assertx(heap.erase(e));
+      // note :
+      //   the vertex ids are shared
+      //   the quadric information is taken from "this" rather than "sc_candi_pairs"
+      std::tie(e->cost, e->w_p0) =
+          compute_contraction_cost_and_location(e->getChild(0)->getId(), e->getChild(1)->getId());
+      assertx(heap.insert(e));
+    }
+  }
+
+  // check the simplices' number
+  //   vertices have not been fully removed (because we need to access "getId()" before)
+  //   but edges/faces are completely removed
+  assertx(num(0) == 1 && num(1) == 0 && num(2) == 0);
+
+  // reverse the collapse operations
+  std::reverse(ecol_record_lst.begin(), ecol_record_lst.end());
+
+  // create the vertex id remapping table
+  std::unordered_map<int, int> remap;  // old vert id --> increasing vert id
+  int vert_idx_inc = 1;                // >= 1
+  for (const auto& record : ecol_record_lst) {
+    // if insertion is new, then vertex id increases
+    vert_idx_inc += int(std::get<1>(remap.emplace(record.vsid, vert_idx_inc)));
+    vert_idx_inc += int(std::get<1>(remap.emplace(record.vtid, vert_idx_inc)));
+  }
+
+  // the vertex id of the starting point
+  int start_v_idx = ecol_record_lst[0].vsid;
+
+  // remap the vertex index
+  for (auto& [vsid, vtid, position_bit, delta_p, topo_record] : ecol_record_lst) {
+    // apply "remap" and update vertex ids
+    vsid = remap.at(vsid);
+    vtid = remap.at(vtid);
+
+    // apply "remap" and update "topo_record"
+    constexpr int INT_MAX_VAL = std::numeric_limits<int>::max();
+    for (auto& [defining_vertex_ids, label] : topo_record) {
+      for (auto& v : defining_vertex_ids) {
+        if (v != INT_MAX_VAL) {
+          v = remap.at(v);
+        }
+      }
+      std::sort(defining_vertex_ids.begin(), defining_vertex_ids.end());
+    }
+  }
+
+  // the starting location
+  Point starting_point_ = getSimplex(0, start_v_idx)->getPosition();
+  std::array<float, 3> starting_point{starting_point_[0], starting_point_[1], starting_point_[2]};
+
+  // compute string code by reconstructing the simplicial complex
+  SimplicialComplex K_recon;
+  std::stringstream ss;
+  ss << "Simplex 0 1 " << starting_point[0] << " " << starting_point[1] << " " << starting_point[2] << "\n";
+  K_recon.read(ss);
+
+  // the output list for vertex splitting operations
+  std::vector<py::dict> vsplit_lst;
+
+  // compute the string code during reconstruction of the simplicial complex
+  //   this is because :
+  //     we have reordered the vertices, making them starting from 1 and increasing during vertex splitting
+  //     the simplex order of the string code really matters
+  //     we need to reconstruct to obtain the order
+  //     and use the order to compute string code
+  for (const auto& ecol_record : ecol_record_lst) {
+    const auto& [vsid, vtid, position_bit, delta_p, topo_record_lst] = ecol_record;
+
+    Simplex vs = assertx(K_recon.getSimplex(0, vsid));
+
+    // compute the ordered queue of adjacent simplices
+    Pqueue<Simplex> pq[3];
+    for (auto s : vs->get_star()) {
+      pq[s->getDim()].enter_unsorted(s, float(s->getId()));
+    }
+
+    // to find the topological label for the query simplex
+    auto find_label = [&](Simplex s) {
+      auto v_ids = compute_defining_vertex_ids(s);
+      for (const auto& [defining_vertex_ids, label] : topo_record_lst) {
+        if (v_ids == defining_vertex_ids) {
+          return label;  // return the topological label
+        }
+      }
+      assertnever("should never reach here");
+    };
+
+    // compute the string code
+    std::string string_code = "";
+    for (int dim : {0, 1, 2}) {
+      pq[dim].sort();
+      while (!pq[dim].empty()) {
+        Simplex s = pq[dim].remove_min();
+        if (dim == 0) {
+          assertx(s == vs);
+          string_code += std::string("9") + std::to_string(find_label(s));
+        } else if (dim == 1) {
+          string_code += std::string("8") + std::to_string(find_label(s));
+        } else {
+          assertx(dim == 2);
+          string_code += std::string("7") + std::to_string(find_label(s));
+        }
+      }
+    }
+
+    // prepare the python dict
+    vsplit_lst.push_back(ecol_record.to_dict(string_code));  // convert to python dictionary
+
+    // build the "SplitRecord" object
+    std::stringstream ss;
+    ss << vsid << " " << vtid << "\n";
+    ss << string_code << "\n";
+    ss << position_bit << " " << delta_p[0] << " " << delta_p[1] << " " << delta_p[2] << "\n";
+    ss << "-1\n-1\n";
+    SplitRecord split_record;
+    split_record.read(ss);
+
+    // apply vertex split
+    split_record.applySplit(K_recon);
+  }
+
+  // output the starting location as well as the operation sequence
+  return std::make_tuple(starting_point, vsplit_lst);
+}
+#endif
 
 }  // namespace hh
