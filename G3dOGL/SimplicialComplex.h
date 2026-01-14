@@ -856,7 +856,8 @@ class SimplicialComplex : noncopyable {
   /* perform simplicial complex simplification, until a single vertex
        note : because it depends on "SplitRecord", so it is best to move the implementation to the cpp file
   */
-  std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> perform_simplification();
+  std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> perform_simplification(
+      bool markov = false);
 #endif
 };
 

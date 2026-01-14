@@ -962,8 +962,8 @@ Simplex SimplicialComplex::createSimplex(int dim, int id) {
 #ifdef BUILD_LIBPSC
 
 /* perform simplicial complex simplification, until a single vertex */
-std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>>
-SimplicialComplex::perform_simplification() {
+std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> SimplicialComplex::perform_simplification(
+    bool markov) {
   // compute quadric for each simplex
   for (int d : {0, 1, 2}) {
     for (auto s : ordered_simplices_dim(d)) {
@@ -1129,8 +1129,21 @@ SimplicialComplex::perform_simplification() {
 
     // update source position, because we will later unify and discard "vt"
     vs->setPosition(p_new);
-    vs->_component_id = vt->_component_id;
-    ISimplex::add_quadric_(vs, vt);
+
+    // recompute connected components
+    //   old manner, wrong for some cases
+    //   for example, four points and two components [A=0, B=0, C=1, D=1]
+    //   we collapse C into B, obtain [A=0, B=1, C=1, D=1]
+    //   meaning A and B are still disconnected
+    //   but actually A~D are all connected now
+    //     vs->_component_id = vt->_component_id;    // v0.2
+    //   so we need to fully recompute connected components
+    //   but this change may introduce behavior difference (compatibility issue)
+    compute_connected_components_();  // >= v0.2.1
+
+    if (!markov) {
+      ISimplex::add_quadric_(vs, vt);
+    }
 
     // unify the two vertices (do not destroy "v1")
     unify(vs, vt);
@@ -1138,18 +1151,68 @@ SimplicialComplex::perform_simplification() {
     // the sc of candidate pairs
     sc_candi_pairs.unify(sc_candi_pairs.getSimplex(0, vsid), sc_candi_pairs.getSimplex(0, vtid), 0, &heap);
 
-    // re-compute the cost
-    for (auto e : sc_candi_pairs.getSimplex(0, vsid)->get_star()) {
-      if (e->getDim() == 0) continue;
-      assertx(e->getDim() == 1);
-      // update
-      assertx(heap.erase(e));
-      // note :
-      //   the vertex ids are shared
-      //   the quadric information is taken from "this" rather than "sc_candi_pairs"
-      std::tie(e->cost, e->w_p0) =
-          compute_contraction_cost_and_location(e->getChild(0)->getId(), e->getChild(1)->getId());
-      assertx(heap.insert(e));
+    if (markov) {
+      // collect all affected vertices (need to update their aggregated quadrics)
+      // they are: vs itself, and all vertices that share an edge with vs.
+      std::set<Simplex> affected_vertices;
+      affected_vertices.insert(vs);
+
+      // for all simplices in vs's star
+      for (auto s : vs->get_star()) {
+        // update native quadrics for vs and all edges/faces in vs's star
+        s->compute_native_quadric_();
+
+        // collect all neighbors of vs (vertices connected via edges)
+        if (s->getDim() == 1) {
+          Simplex oppo = s->opp_vertex(vs);
+          assertx(oppo);
+          affected_vertices.insert(oppo);
+        }
+      }
+
+      // re-aggregate quadrics for all affected vertices
+      for (Simplex v : affected_vertices) {
+        // reset to native quadric first
+        v->compute_native_quadric_();
+        // then aggregate from neighbors
+        v->aggregate_();
+      }
+
+      // update heap for candidate edges involving affected vertices
+      std::set<Simplex> edges_to_update;
+      for (Simplex v : affected_vertices) {
+        int vid = v->getId();
+        Simplex v_candi = sc_candi_pairs.getSimplex(0, vid);
+        assertx(v_candi);
+        for (auto e : v_candi->get_star()) {
+          if (e->getDim() == 0) continue;
+          assertx(e->getDim() == 1);
+          edges_to_update.insert(e);
+        }
+      }
+
+      // re-compute quadrics and costs for affected edges
+      for (Simplex e : edges_to_update) {
+        assertx(heap.erase(e));
+        std::tie(e->cost, e->w_p0) =
+            compute_contraction_cost_and_location(e->getChild(0)->getId(), e->getChild(1)->getId());
+        assertx(heap.insert(e));
+      }
+
+    } else {
+      // re-compute the cost
+      for (auto e : sc_candi_pairs.getSimplex(0, vsid)->get_star()) {
+        if (e->getDim() == 0) continue;
+        assertx(e->getDim() == 1);
+        // update
+        assertx(heap.erase(e));
+        // note :
+        //   the vertex ids are shared
+        //   the quadric information is taken from "this" rather than "sc_candi_pairs"
+        std::tie(e->cost, e->w_p0) =
+            compute_contraction_cost_and_location(e->getChild(0)->getId(), e->getChild(1)->getId());
+        assertx(heap.insert(e));
+      }
     }
 
     // append the old cost
