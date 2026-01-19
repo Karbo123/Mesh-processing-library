@@ -2,8 +2,12 @@
 #ifndef MESH_PROCESSING_G3DOGL_SIMPLICIALCOMPLEX_H_
 #define MESH_PROCESSING_G3DOGL_SIMPLICIALCOMPLEX_H_
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 #ifdef BUILD_LIBPSC
 #include <libqhullcpp/Qhull.h>
@@ -12,13 +16,9 @@
 #include <libqhullcpp/QhullVertexSet.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <algorithm>
-#include <array>
-#include <cmath>
 #include <limits>
 #include <sstream>
 #include <tuple>
-#include <vector>
 namespace py = pybind11;
 using namespace orgQhull;
 #endif
@@ -131,6 +131,136 @@ inline std::vector<std::array<int, 4>> compute_delaunay_3d(const std::vector<Poi
 
 #endif
 
+// compute bounding edges of the (non-degenerate) convex hull of four input points
+// handles cases:
+// - 0D : all points coincident     => no edges
+// - 1D : all points collinear      => one edge between the two most distant points
+// - 2D : all points coplanar       => convex hull in 2D projection (using monotone chain algorithm)
+// - 3D : points form a tetrahedron => all edges of the tetrahedron
+inline std::vector<std::array<int, 2>> computeConvexHullEdge(const Point& v0, const Point& v1, const Point& v2,
+                                                             const Point& v3, double kEpsCoord) {
+  constexpr double kEpsFp64 = 1e-12;
+
+  // small epsilon relative to the bounding scale of the points
+  // by setting kEpsCoord==0, we assume the tetrahedron is never degenerate
+  if (kEpsCoord == 0.0) {
+    return {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+  }
+  double kEpsCoordSq = kEpsCoord * kEpsCoord;
+  double kEpsCoordCu = kEpsCoordSq * kEpsCoord;
+
+  // utilities
+  using Vec3d = Vec3<double>;
+  auto mk_edge = [](int i, int j) -> std::array<int, 2> {
+    auto [a, b] = std::minmax(i, j);
+    return {a, b};
+  };
+  struct P2 {
+    double x, y;
+    int id;
+  };
+  using PointsP2 = std::array<P2, 4>;
+
+  // convert to double precision (for more accurate geometric tests)
+  std::array<Vec3d, 4> pts = {v0.cast<double>(), v1.cast<double>(), v2.cast<double>(), v3.cast<double>()};
+
+  // normalize point coordinates within a unit sphere
+  Vec3d center = (pts[0] + pts[1] + pts[2] + pts[3]) / 4.0;
+  double scale = 0.0;
+  for (int i = 0; i < 4; ++i) {
+    scale = std::max(scale, mag(pts[i] - center));
+  }
+  if (scale < kEpsFp64) return {};  // all points coincident (0D)
+  for (int i : {0, 1, 2, 3}) pts[i] = (pts[i] - center) / scale;
+
+  // check the volume (3D)
+  Vec3d e1 = pts[1] - pts[0], e2 = pts[2] - pts[0], e3 = pts[3] - pts[0];
+  double triple_prod = std::abs(dot(e1, cross(e2, e3)));
+  if (triple_prod > kEpsCoordCu) {  // not degenerate, return all possible edges
+    return {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+  }
+
+  // find the triangle with the largest area (best 2D projection plane)
+  constexpr int tris[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+  double best_area = 0.0;
+  Vec3d normal = {0., 0., 1.};
+  int ref0 = 0, ref1 = 1;
+  for (const auto& t : tris) {
+    Vec3d n = cross(pts[t[1]] - pts[t[0]], pts[t[2]] - pts[t[0]]);
+    double area = mag(n);
+    if (area > best_area) {
+      best_area = area;
+      normal = n;
+      ref0 = t[0];
+      ref1 = t[1];
+    }
+  }
+
+  // check if all points collinear (1D)
+  if (best_area < kEpsCoordSq) {
+    int bi = 0, bj = 1;
+    double max_d = 0.0;
+    for (int i = 0; i < 4; ++i)
+      for (int j = i + 1; j < 4; ++j) {
+        double d = mag(pts[i] - pts[j]);
+        if (d > max_d) {
+          max_d = d;
+          bi = i;
+          bj = j;
+        }
+      }
+    return max_d > kEpsCoord ? std::vector<std::array<int, 2>>{mk_edge(bi, bj)} : std::vector<std::array<int, 2>>{};
+  }
+
+  // find convex hull via monotone chain (2D)
+  auto compute_monotone_chain = [&](PointsP2 points) {
+    auto cross2 = [](const P2& O, const P2& A, const P2& B) {
+      return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+    };
+
+    std::sort(points.begin(), points.end(),
+              [](const P2& a, const P2& b) { return a.x < b.x || (a.x == b.x && a.y < b.y); });
+
+    std::array<P2, 8> hull;
+    int k = 0;
+
+    // lower hull
+    for (int i = 0; i < 4; ++i) {
+      while (k >= 2 && cross2(hull[k - 2], hull[k - 1], points[i]) <= 0) k--;
+      hull[k++] = points[i];
+    }
+
+    // upper hull
+    for (int i = 2, t = k + 1; i >= 0; i--) {
+      while (k >= t && cross2(hull[k - 2], hull[k - 1], points[i]) <= 0) k--;
+      hull[k++] = points[i];
+    }
+    int hull_size = std::max(0, k - 1);
+
+    std::vector<std::array<int, 2>> edges;
+    if (hull_size >= 2) {
+      edges.reserve(hull_size);
+      for (int i = 0; i < hull_size; ++i) {
+        edges.push_back(mk_edge(hull[i].id, hull[(i + 1) % hull_size].id));
+      }
+    }
+    return edges;
+  };
+
+  normal.normalize();
+  Vec3d X = pts[ref1] - pts[ref0];
+  X.normalize();
+  Vec3d Y = cross(normal, X);
+
+  PointsP2 p2s;
+  for (int i = 0; i < 4; ++i) {
+    Vec3d v = pts[i] - pts[ref0];
+    p2s[i] = {dot(v, X), dot(v, Y), i};
+  }
+
+  return compute_monotone_chain(p2s);
+}
+
 class ISimplex : noncopyable {
  public:
   friend class SimplicialComplex;
@@ -228,6 +358,11 @@ class ISimplex : noncopyable {
   //   we store the information in edges of a separate simplicial complex
   float cost;
   float w_p0;  // "p0" is "getChild(0)"
+
+  // for tracking the subtree depth in the binary tree of edge collapses
+  //   used for balanced tree construction when _weighting_balanced > 0
+  int _subtree_depth = 1;
+  int _subtree_size = 1;
 
   // quadric information
   Matrix3 _A{};  // initialized to all zeros
@@ -471,9 +606,9 @@ class MinHeap {
   struct CompareByCost {
     bool operator()(Simplex a, Simplex b) const {
 #ifdef BUILD_LIBPSC
-      // if cost is the same, compare the address
+      // if cost is the same, compare the ids
       //   minimum element comes first
-      return (a->cost == b->cost) ? a < b : a->cost < b->cost;
+      return (a->cost == b->cost) ? a->getId() < b->getId() : a->cost < b->cost;
 #else
       // dummy
       return true;
@@ -559,6 +694,19 @@ class SimplicialComplex : noncopyable {
  public:
   //  the multiplicative factor for the cost if the vertices are from different components
   float _weighting_topo = 1.0f;
+
+  // weighting factor for encouraging balanced binary tree construction
+  //   0.0 means no balancing consideration
+  //   positive values penalize unbalanced merges (larger difference in subtree depths)
+  float _weighting_balanced = 0.0f;
+  float _alpha_balanced = 1.0f;
+  bool _balanced_depth = true;
+
+  // the aspect ratio threshold to consider a simplex degenerate
+  float _ratio_degeneracy = 0.0f;  // for computing candidate pairs
+
+  // whether to entirely recompute connected component ids after each edge collapse
+  bool _recompute_component_ids = false;
 
   /* the data type for recording the operations */
   struct EcolRecord {
@@ -656,17 +804,17 @@ class SimplicialComplex : noncopyable {
 
     // add edges from the Delaunay complex that connect with different components
     for (const auto& tet : tets) {
+      auto edges =
+          computeConvexHullEdge(verts[tet[0]], verts[tet[1]], verts[tet[2]], verts[tet[3]], _ratio_degeneracy);
       // for each edge pair from the tetrahedron
-      for (int i = 0; i < 4; ++i) {
-        for (int j = i + 1; j < 4; ++j) {
-          Simplex v0 = verts_ptr[tet[i]];
-          Simplex v1 = verts_ptr[tet[j]];
-          assertx(v0->_component_id >= 0);
-          assertx(v1->_component_id >= 0);
-          // only add the edge if they are in different components
-          if (v0->_component_id != v1->_component_id) {
-            add(v0, v1);
-          }
+      for (auto [i, j] : edges) {
+        Simplex v0 = verts_ptr[tet[i]];
+        Simplex v1 = verts_ptr[tet[j]];
+        assertx(v0->_component_id >= 0);
+        assertx(v1->_component_id >= 0);
+        // only add the edge if they are in different components
+        if (v0->_component_id != v1->_component_id) {
+          add(v0, v1);
         }
       }
     }
@@ -798,7 +946,8 @@ class SimplicialComplex : noncopyable {
             .topo_record_lst = topo_record_lst};
   }
 
-  /* evaluate the cost of edge contraction */
+  /* evaluate the cost of edge contraction between two vertices
+   */
   std::pair<float, float> compute_contraction_cost_and_location(int v0_id, int v1_id) {
     Simplex v0 = getSimplex(0, v0_id);
     Simplex v1 = getSimplex(0, v1_id);
@@ -847,6 +996,33 @@ class SimplicialComplex : noncopyable {
     // if the two vertices are in different components, we may need to penalize the cost
     if (v0->_component_id != v1->_component_id) {
       cost_min *= _weighting_topo;
+    }
+
+    // add penalty for unbalanced merges when _weighting_balanced > 0.
+    if (_weighting_balanced > 0.0f) {
+      // determine the value for balancing
+      float value;
+      if (_balanced_depth) {
+        float depth_0 = static_cast<float>(v0->_subtree_depth);
+        float depth_1 = static_cast<float>(v1->_subtree_depth);
+        value = 1.0f + std::max(depth_0, depth_1);
+      } else {
+        float size_0 = static_cast<float>(v0->_subtree_size);
+        float size_1 = static_cast<float>(v1->_subtree_size);
+        value = size_0 + size_1;
+      }
+      // piecewise function
+      float ratio;
+      if (_alpha_balanced > 0.0f) {
+        ratio = std::pow(_alpha_balanced, value);  // exponential growth
+      } else if (_alpha_balanced == 0.0f) {
+        ratio = value;  // linear growth
+      } else {
+        ratio = std::pow(value, -_alpha_balanced);  // polynomial growth
+      }
+      // the multiplicative factor
+      float balance_factor = 1.0f + _weighting_balanced * ratio;
+      cost_min *= balance_factor;
     }
 
     // return the cost and the location weighting

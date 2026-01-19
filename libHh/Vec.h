@@ -94,7 +94,7 @@ template <typename T, int n> class Vec : details::VecBase<T, n> {
   ArrayView<T> slice(int ib, int ie) { return segment(ib, ie - ib); }
   CArrayView<T> slice(int ib, int ie) const { return segment(ib, ie - ib); }
   template <typename U> Vec<U, n> cast() const {
-    return map([](const auto& e) { return static_cast<U>(e); });
+    return map(*this, [](const auto& e) { return static_cast<U>(e); });
   }
   using value_type = T;
   using iterator = T*;

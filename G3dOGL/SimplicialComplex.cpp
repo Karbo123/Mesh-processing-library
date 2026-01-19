@@ -1013,6 +1013,7 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     v1->addParent(e);
 
     // compute contraction cost and new location
+    //   subtree depths are initially 1 for each vertex (already initialized in ISimplex)
     std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(idx_v0, idx_v1);
 
     // add to heap
@@ -1130,16 +1131,19 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     // update source position, because we will later unify and discard "vt"
     vs->setPosition(p_new);
 
-    // recompute connected components
-    //   old manner, wrong for some cases
-    //   for example, four points and two components [A=0, B=0, C=1, D=1]
-    //   we collapse C into B, obtain [A=0, B=1, C=1, D=1]
-    //   meaning A and B are still disconnected
-    //   but actually A~D are all connected now
-    //     vs->_component_id = vt->_component_id;    // v0.2
-    //   so we need to fully recompute connected components
-    //   but this change may introduce behavior difference (compatibility issue)
-    compute_connected_components_();  // >= v0.2.1
+    if (_recompute_component_ids) {
+      // fully recompute connected components
+      //   a little bit slower
+      compute_connected_components_();  // >= v0.2.1
+    } else {
+      // the old manner, for backward compatibility
+      //   old manner, wrong for some cases
+      //   for example, four points and two components [A=0, B=0, C=1, D=1]
+      //   we collapse C into B, obtain [A=0, B=1, C=1, D=1]
+      //   meaning A and B are still disconnected
+      //   but actually A~D are all connected now
+      vs->_component_id = vt->_component_id;  // v0.2
+    }
 
     if (!markov) {
       ISimplex::add_quadric_(vs, vt);
@@ -1149,7 +1153,17 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     unify(vs, vt);
 
     // the sc of candidate pairs
-    sc_candi_pairs.unify(sc_candi_pairs.getSimplex(0, vsid), sc_candi_pairs.getSimplex(0, vtid), 0, &heap);
+    //   update subtree depth: the merged vertex inherits 1 + max(depths)
+    Simplex vs_candi = sc_candi_pairs.getSimplex(0, vsid);
+    Simplex vt_candi = sc_candi_pairs.getSimplex(0, vtid);
+    int new_subtree_depth = 1 + std::max(vs_candi->_subtree_depth, vt_candi->_subtree_depth);
+    int new_subtree_size = vs_candi->_subtree_size + vt_candi->_subtree_size;
+    sc_candi_pairs.unify(vs_candi, vt_candi, 0, &heap);
+    //   after unify, vs_candi survives, so update its subtree depth
+    vs_candi->_subtree_depth = new_subtree_depth;
+    vs_candi->_subtree_size = new_subtree_size;
+    vs->_subtree_depth = new_subtree_depth;
+    vs->_subtree_size = new_subtree_size;
 
     if (markov) {
       // collect all affected vertices (need to update their aggregated quadrics)
@@ -1194,8 +1208,9 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
       // re-compute quadrics and costs for affected edges
       for (Simplex e : edges_to_update) {
         assertx(heap.erase(e));
-        std::tie(e->cost, e->w_p0) =
-            compute_contraction_cost_and_location(e->getChild(0)->getId(), e->getChild(1)->getId());
+        Simplex c0 = e->getChild(0);
+        Simplex c1 = e->getChild(1);
+        std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(c0->getId(), c1->getId());
         assertx(heap.insert(e));
       }
 
@@ -1209,8 +1224,9 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
         // note :
         //   the vertex ids are shared
         //   the quadric information is taken from "this" rather than "sc_candi_pairs"
-        std::tie(e->cost, e->w_p0) =
-            compute_contraction_cost_and_location(e->getChild(0)->getId(), e->getChild(1)->getId());
+        Simplex c0 = e->getChild(0);
+        Simplex c1 = e->getChild(1);
+        std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(c0->getId(), c1->getId());
         assertx(heap.insert(e));
       }
     }
