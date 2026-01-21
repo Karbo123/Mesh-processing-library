@@ -604,11 +604,39 @@ class MinHeap {
 
  private:
   struct CompareByCost {
+    // helper to create a canonical tuple from two positions for comparison
+    static std::tuple<float, float, float, float, float, float> make_canonical_edge_key(const Point& p0,
+                                                                                        const Point& p1) {
+      // compare positions lexicographically to determine order
+      auto as_tuple = [](const Point& p) { return std::make_tuple(p[0], p[1], p[2]); };
+      auto t0 = as_tuple(p0);
+      auto t1 = as_tuple(p1);
+      if (t0 <= t1) {
+        return std::make_tuple(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]);
+      } else {
+        return std::make_tuple(p1[0], p1[1], p1[2], p0[0], p0[1], p0[2]);
+      }
+    }
+
     bool operator()(Simplex a, Simplex b) const {
 #ifdef BUILD_LIBPSC
-      // if cost is the same, compare the ids
-      //   minimum element comes first
-      return (a->cost == b->cost) ? a->getId() < b->getId() : a->cost < b->cost;
+      // primary comparison: by cost
+      if (a->cost != b->cost) {
+        return a->cost < b->cost;
+      }
+
+      // tiebreaker: compare by vertex positions (geometry) to ensure determinism
+      // independent of vertex ID assignment.
+      assertx(a->getDim() == 1 && b->getDim() == 1);
+      Point a_p0 = a->getChild(0)->getPosition();
+      Point a_p1 = a->getChild(1)->getPosition();
+      Point b_p0 = b->getChild(0)->getPosition();
+      Point b_p1 = b->getChild(1)->getPosition();
+
+      // create canonical edge keys and compare
+      auto a_key = make_canonical_edge_key(a_p0, a_p1);
+      auto b_key = make_canonical_edge_key(b_p0, b_p1);
+      return a_key < b_key;
 #else
       // dummy
       return true;
@@ -618,6 +646,15 @@ class MinHeap {
 
   std::set<Simplex, CompareByCost> cost_sorted;
   std::unordered_map<Simplex, std::set<Simplex, CompareByCost>::iterator> iter_lookup;
+};
+
+struct SimplexIdCompare {
+  // use getid() for deterministic sorting instead of relying on pointer addresses,
+  // to avoid results being affected by random memory allocation.
+  bool operator()(const Simplex& s1, const Simplex& s2) const {
+    if (s1->getDim() != s2->getDim()) return s1->getDim() < s2->getDim();
+    return s1->getId() < s2->getId();
+  }
 };
 
 class SimplicialComplex : noncopyable {
@@ -750,7 +787,11 @@ class SimplicialComplex : noncopyable {
     // assign a component id to each vertex
     std::unordered_map<Simplex, int> rep_to_id;  // root --> id
     int id_counter = 0;
-    for (auto& [vtx, _] : ds.parent) {
+    std::vector<Simplex> sorted_vertices;
+    for (auto& [vtx, _] : ds.parent) sorted_vertices.push_back(vtx);
+    // sort vertices by id to ensure deterministic assignment of connected component ids.
+    std::sort(sorted_vertices.begin(), sorted_vertices.end(), SimplexIdCompare());
+    for (Simplex vtx : sorted_vertices) {
       Simplex root = ds.find(vtx);
       if (!rep_to_id.count(root)) {
         rep_to_id[root] = id_counter++;
@@ -845,7 +886,7 @@ class SimplicialComplex : noncopyable {
     // get the neighborhood of both "vs" and "vt"
     auto vs_star = vs->get_star();
     auto vt_star = vt->get_star();
-    std::set<Simplex> vst_star;  // some are overlapped, so we use "std::set"
+    std::set<Simplex, SimplexIdCompare> vst_star;  // some are overlapped, so we use "std::set"
     vst_star.insert(vs_star.begin(), vs_star.end());
     vst_star.insert(vt_star.begin(), vt_star.end());
 

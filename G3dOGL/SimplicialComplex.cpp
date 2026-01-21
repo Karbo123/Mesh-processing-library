@@ -66,6 +66,8 @@ PArray<Simplex, 20> ISimplex::get_star() const {
       }
     }
   }
+  // ensure returned simplex list has a fixed order, independent of memory addresses.
+  std::sort(simplices.begin(), simplices.end(), SimplexIdCompare());
   return simplices;
 }
 
@@ -76,6 +78,8 @@ PArray<Simplex, 20> ISimplex::faces_of_vertex() const {
   for (Simplex e : s->getParents())
     for (Simplex f : e->getParents())
       if (!simplices.contains(f)) simplices.push(f);
+  // ensure returned simplex list has a fixed order, independent of memory addresses.
+  std::sort(simplices.begin(), simplices.end(), SimplexIdCompare());
   return simplices;
 }
 
@@ -334,6 +338,8 @@ bool SimplicialComplex::eq2simp(Simplex s1, Simplex s2) const {
 void SimplicialComplex::unify(Simplex vs, Simplex vt, int propagate_area, MinHeap* heap) {
   assertx(vs->getDim() == 0 && vt->getDim() == 0);
 
+  // keep the map using default pointer comparison because it contains dangling pointers
+  // after destroySimplex() calls; dereferencing those in a comparator would be undefined.
   std::map<Simplex, int> modified_simplices;
   if (heap) {
     for (auto v : {vs, vt}) {
@@ -1029,12 +1035,13 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     Simplex vt = getSimplex(0, vtid);
     auto face_s = vs->faces_of_vertex();
     auto face_t = vt->faces_of_vertex();
-    std::set<Simplex> face_set_s(face_s.begin(), face_s.end());
-    std::set<Simplex> face_set_t(face_t.begin(), face_t.end());
+    // use simplexidcompare to ensure deterministic set operations.
+    std::set<Simplex, SimplexIdCompare> face_set_s(face_s.begin(), face_s.end());
+    std::set<Simplex, SimplexIdCompare> face_set_t(face_t.begin(), face_t.end());
 
     // symmetric difference
-    std::set<Simplex> affected_faces = [&] {
-      std::set<Simplex> result;
+    std::set<Simplex, SimplexIdCompare> affected_faces = [&] {
+      std::set<Simplex, SimplexIdCompare> result;
       for (auto f : face_set_s)
         if (!face_set_t.count(f)) result.insert(f);
       for (auto f : face_set_t)
@@ -1168,7 +1175,8 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     if (markov) {
       // collect all affected vertices (need to update their aggregated quadrics)
       // they are: vs itself, and all vertices that share an edge with vs.
-      std::set<Simplex> affected_vertices;
+      // use simplexidcompare to ensure deterministic iteration order, so that quadric accumulation results are consistent.
+      std::set<Simplex, SimplexIdCompare> affected_vertices;
       affected_vertices.insert(vs);
 
       // for all simplices in vs's star
@@ -1193,7 +1201,8 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
       }
 
       // update heap for candidate edges involving affected vertices
-      std::set<Simplex> edges_to_update;
+      // use simplexidcompare to guarantee deterministic heap update order.
+      std::set<Simplex, SimplexIdCompare> edges_to_update;
       for (Simplex v : affected_vertices) {
         int vid = v->getId();
         Simplex v_candi = sc_candi_pairs.getSimplex(0, vid);

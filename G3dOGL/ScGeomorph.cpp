@@ -328,14 +328,23 @@ void ScGeomorph::update(float alpha, ArrayView<Vector> corner_nors) {  // alpha 
   for (Simplex v : K.simplices_dim(0)) v->setPosition(interp(vnew[v->getId()], vold[v->getId()], alpha));
 
   // area
-  for (auto& [s, narea] : anew) {
+  Array<Simplex> anew_keys(anew.keys());
+  // sort keys by simplex id when iterating over the map to ensure deterministic update order.
+  // this avoids subtle numerical differences due to floating-point operation order.
+  std::sort(anew_keys.begin(), anew_keys.end(), SimplexIdCompare());
+  for (Simplex s : anew_keys) {
+    float narea = anew.get(s);
     assertx(s->isPrincipal());
     float oarea = 0.f;
     if (aold.contains(s)) oarea = aold.get(s);
     s->setArea(alpha * narea + (1.f - alpha) * oarea);
   }
 
-  for (auto& [s, oarea] : aold) {
+  Array<Simplex> aold_keys(aold.keys());
+  // sort old area keys to maintain determinism.
+  std::sort(aold_keys.begin(), aold_keys.end(), SimplexIdCompare());
+  for (Simplex s : aold_keys) {
+    float oarea = aold.get(s);
     // handled by anew
     if (!s->isPrincipal()) {
       s->setArea((1.f - alpha) * oarea);
