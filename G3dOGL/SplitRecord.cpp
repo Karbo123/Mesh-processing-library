@@ -1,9 +1,14 @@
 // -*- C++ -*-  Copyright (c) Microsoft Corporation; see license.txt
 #include "G3dOGL/SplitRecord.h"
 
+#include <iomanip>
+
 namespace hh {
 
 void SplitRecord::write(std::ostream& os) const {
+  const auto old_precision = os.precision();
+  os << std::setprecision(17);
+
   os << _vsid << " " << _vtid << "\n";
   for_int(i, _outcome.num() - 1) os << _outcome[i];
   os << "\n";
@@ -12,6 +17,8 @@ void SplitRecord::write(std::ostream& os) const {
     os << _material[i].dim << " " << _material[i].id << " " << _material[i].matid << "\n";
   }
   for_int(i, _area.num()) os << _area[i].dim << " " << _area[i].id << " " << _area[i].area << "\n";
+
+  os << std::setprecision(old_precision);
 }
 
 bool SplitRecord::read(std::istream& is) {
@@ -48,7 +55,7 @@ bool SplitRecord::read(std::istream& is) {
   }
 
   // get the partition area
-  float area;
+  double area;
   assertx(is >> dim);
   while (dim != -1) {
     assertx(is >> id >> area);
@@ -68,7 +75,7 @@ void SplitRecord::applySplit(SimplicialComplex& K) {
   Simplex vt = nullptr;
 
   Pqueue<Simplex> pq[ISimplex::MAX_DIM + 1];
-  for (Simplex spx : vs->get_star()) pq[spx->getDim()].enter_unsorted(spx, float(spx->getId()));
+  for (Simplex spx : vs->get_star()) pq[spx->getDim()].enter_unsorted(spx, static_cast<double>(spx->getId()));
 
   if (0) {
     SimplicialComplex sb;
@@ -89,14 +96,14 @@ void SplitRecord::applySplit(SimplicialComplex& K) {
     outcome = getNextOutcome();
 
     vt = K.createSimplex(0);
-    const Point& vsp = vs->getPosition();
-    const Point& dp = _deltap;
+    const Pointd& vsp = vs->getPosition();
+    const Pointd& dp = _deltap;
     // always set vt's position
-    vt->setPosition(Point(dp[0] + vsp[0], dp[1] + vsp[1], dp[2] + vsp[2]));
+    vt->setPosition(Pointd(dp[0] + vsp[0], dp[1] + vsp[1], dp[2] + vsp[2]));
 
     // if vs is at a former midpoint need to update vs as well
     if (_pos_bit == 0)  // Midpoint.
-      vs->setPosition(Point(vsp[0] - dp[0], vsp[1] - dp[1], vsp[2] - dp[2]));
+      vs->setPosition(Pointd(vsp[0] - dp[0], vsp[1] - dp[1], vsp[2] - dp[2]));
 
     if (outcome == SplitRecord::V_NOEDGE && vs->isPrincipal()) {
     }
@@ -212,7 +219,7 @@ void SplitRecord::applyGMSplit(SimplicialComplex& K) {
   Simplex vt = nullptr;
 
   Pqueue<Simplex> pq[ISimplex::MAX_DIM + 1];
-  for (Simplex spx : vs->get_star()) pq[spx->getDim()].enter_unsorted(spx, float(spx->getId()));
+  for (Simplex spx : vs->get_star()) pq[spx->getDim()].enter_unsorted(spx, static_cast<double>(spx->getId()));
 
   if (0) {
     SimplicialComplex sb;
@@ -235,14 +242,14 @@ void SplitRecord::applyGMSplit(SimplicialComplex& K) {
     outcome = getNextOutcome();
 
     vt = K.createSimplex(0);
-    const Point& vsp = vs->getPosition();
-    const Point& dp = _deltap;
+    const Pointd& vsp = vs->getPosition();
+    const Pointd& dp = _deltap;
     // always set vt's position
-    vt->setPosition(Point(dp[0] + vsp[0], dp[1] + vsp[1], dp[2] + vsp[2]));
+    vt->setPosition(Pointd(dp[0] + vsp[0], dp[1] + vsp[1], dp[2] + vsp[2]));
 
     // if vs is at a former midpoint need to update vs as well
     if (_pos_bit == 0)  // Midpoint.
-      vs->setPosition(Point(vsp[0] - dp[0], vsp[1] - dp[1], vsp[2] - dp[2]));
+      vs->setPosition(Pointd(vsp[0] - dp[0], vsp[1] - dp[1], vsp[2] - dp[2]));
 
     if (outcome == SplitRecord::V_NOEDGE && vs->isPrincipal()) {
     }
@@ -359,7 +366,7 @@ void SplitRecord::applyCmpSplit(SimplicialComplex& K) {
   Simplex vt = nullptr;
 
   Pqueue<Simplex> pq[ISimplex::MAX_DIM + 1];
-  for (Simplex spx : vs->get_star()) pq[spx->getDim()].enter_unsorted(spx, float(spx->getId()));
+  for (Simplex spx : vs->get_star()) pq[spx->getDim()].enter_unsorted(spx, static_cast<double>(spx->getId()));
 
   if (0) {
     SimplicialComplex sb;
@@ -383,14 +390,14 @@ void SplitRecord::applyCmpSplit(SimplicialComplex& K) {
 
     vt = K.createSimplex(0);
     new_simplices.push_back(vt);
-    const Point& vsp = vs->getPosition();
-    const Point& dp = _deltap;
+    const Pointd& vsp = vs->getPosition();
+    const Pointd& dp = _deltap;
     // always set vt's position
-    vt->setPosition(Point(dp[0] + vsp[0], dp[1] + vsp[1], dp[2] + vsp[2]));
+    vt->setPosition(Pointd(dp[0] + vsp[0], dp[1] + vsp[1], dp[2] + vsp[2]));
 
     // if vs is at a former midpoint need to update vs as well
     if (_pos_bit == 0)  // Midpoint.
-      vs->setPosition(Point(vsp[0] - dp[0], vsp[1] - dp[1], vsp[2] - dp[2]));
+      vs->setPosition(Pointd(vsp[0] - dp[0], vsp[1] - dp[1], vsp[2] - dp[2]));
 
     if (outcome == SplitRecord::V_NOEDGE && vs->isPrincipal()) {
     }
@@ -509,7 +516,7 @@ void SplitRecord::applyUnify(SimplicialComplex& K) const {
   Simplex vs = assertx(K.getSimplex(0, _vsid));
   Simplex vt = assertx(K.getSimplex(0, _vtid));
 
-  Point new_pos = vs->getPosition();
+  Pointd new_pos = vs->getPosition();
   if (_pos_bit == 0) new_pos = interp(vs->getPosition(), vt->getPosition());
 
   K.unify(vs, vt);

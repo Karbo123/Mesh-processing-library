@@ -3907,7 +3907,8 @@ void read_sc(const string& filename) {
   for (Simplex s2 : Kmesh.simplices_dim(2)) {
     Vec3<Simplex> v;
     s2->vertices(v.data());
-    fct_pnor[s2->getId()] = ok_normalized(cross(v[0]->getPosition(), v[1]->getPosition(), v[2]->getPosition()));
+    fct_pnor[s2->getId()] = ok_normalized(cross(v[0]->getPosition(), v[1]->getPosition(), v[2]->getPosition())
+                                              .template cast<float>());
   }
   for (Simplex s2 : Kmesh.simplices_dim(2)) {
     Vec3<Simplex> verts;
@@ -4048,7 +4049,8 @@ void psc_update_lod() {
           assertx(s2->getDim() == 2);
           nr.fid = s2->getId();
           s2->vertices(verts.data());
-          nr.fct_nor = ok_normalized(cross(verts[0]->getPosition(), verts[1]->getPosition(), verts[2]->getPosition()));
+          nr.fct_nor = ok_normalized(cross(verts[0]->getPosition(), verts[1]->getPosition(), verts[2]->getPosition())
+                                         .template cast<float>());
           fct_pnor.access(nr.fid);
           fct_pnor[nr.fid] = nr.fct_nor;
           anr.push(nr);
@@ -4137,7 +4139,8 @@ void psc_update_lod() {
           assertx(s2->getDim() == 2);
           s2->vertices(verts.data());
           nr.fid = s2->getId();
-          nr.fct_nor = ok_normalized(cross(verts[0]->getPosition(), verts[1]->getPosition(), verts[2]->getPosition()));
+          nr.fct_nor = ok_normalized(cross(verts[0]->getPosition(), verts[1]->getPosition(), verts[2]->getPosition())
+                                         .template cast<float>());
           fct_pnor.access(nr.fid);
           fct_pnor[nr.fid] = nr.fct_nor;
           anr.push(nr);
@@ -4146,7 +4149,8 @@ void psc_update_lod() {
           assertx(s2->getDim() == 2);
           s2->vertices(verts.data());
           nr.fid = s2->getId();
-          nr.fct_nor = ok_normalized(cross(verts[0]->getPosition(), verts[1]->getPosition(), verts[2]->getPosition()));
+          nr.fct_nor = ok_normalized(cross(verts[0]->getPosition(), verts[1]->getPosition(), verts[2]->getPosition())
+                                         .template cast<float>());
           fct_pnor.access(nr.fid);
           fct_pnor[nr.fid] = nr.fct_nor;
           anr.push(nr);
@@ -4307,6 +4311,8 @@ inline float projected_area(float area, const Point& x) {
   return area * t1 / (view_zoom * dist(x, tcam.p()));
 }
 
+inline float projected_area(float area, const Pointd& x) { return projected_area(area, x.cast<float>()); }
+
 void draw_point(const Point& vp, float area) {
   float sphererad = sqrt(area / (TAU * 2));
   sphererad = max(sphererad, minpointradius);
@@ -4322,6 +4328,8 @@ void draw_point(const Point& vp, float area) {
   complexity *= 2;
   render_sphere(vp, sphererad, complexity, complexity);
 }
+
+void draw_point(const Pointd& vp, float area) { draw_point(vp.cast<float>(), area); }
 
 void draw_sc() {
   if (defining_dl) Warning("Display lists should be off ('DC') if zooming in/out");
@@ -4348,9 +4356,12 @@ void draw_sc() {
       v0 = verts[0];
       v1 = verts[1];
       v2 = verts[2];
-      const Point& p0 = v0->getPosition();
-      const Point& p1 = v1->getPosition();
-      const Point& p2 = v2->getPosition();
+      const Pointd& p0 = v0->getPosition();
+      const Pointd& p1 = v1->getPosition();
+      const Pointd& p2 = v2->getPosition();
+      const Point p0f = p0.cast<float>();
+      const Point p1f = p1.cast<float>();
+      const Point p2f = p2.cast<float>();
       Vector n0 = corner_pnor[3 * s2->getId()];
       Vector n1 = corner_pnor[3 * s2->getId() + 1];
       Vector n2 = corner_pnor[3 * s2->getId() + 2];
@@ -4358,11 +4369,11 @@ void draw_sc() {
         n0 = n1 = n2 = fct_pnor[s2->getId()];
       }
       glNormal3fv(n0.data());
-      glVertex3fv(p0.data());
+      glVertex3fv(p0f.data());
       glNormal3fv(n1.data());
-      glVertex3fv(p1.data());
+      glVertex3fv(p1f.data());
       glNormal3fv(n2.data());
-      glVertex3fv(p2.data());
+      glVertex3fv(p2f.data());
     }
     glEnd();
     // draw all 1-simplices with no parents
@@ -4373,17 +4384,17 @@ void draw_sc() {
       for (Simplex s1 : psc_principal_edges) {
         assertx(s1->isPrincipal());
         psc_orphan_nedges++;
-        const Point& vj = s1->getChild(0)->getPosition();
-        const Point& vk = s1->getChild(1)->getPosition();
+        const Pointd& vj = s1->getChild(0)->getPosition();
+        const Pointd& vk = s1->getChild(1)->getPosition();
         float area = s1->getArea();
         assertx(area >= 0.f);
         // radius of a cylinder from vj to vk with same area
         float rad;
-        float height = dist(vj, vk);
+        float height = static_cast<float>(dist(vj, vk));
         rad = area / (TAU * height);
         rad = max(rad, minedgeradius);
         // cylinder center
-        const Point& center = interp(vj, vk);
+        const Pointd center = interp(vj, vk);
         if (height < 2.f * rad) {
           // draw as point
           maybe_update_mat_diffuse(usedefaultcolor ? default_diffuse_color : s_color[s1->getVAttribute()]);
@@ -4401,15 +4412,17 @@ void draw_sc() {
           update_cur_color(usedefaultcolor ? default_diffuse_color : s_color[s1->getVAttribute()]);
           set_thickness(thickness);
           glBegin(GL_LINES);
-          glVertex3fv(vj.data());
-          glVertex3fv(vk.data());
+          const Point vjf = vj.cast<float>();
+          const Point vkf = vk.cast<float>();
+          glVertex3fv(vjf.data());
+          glVertex3fv(vkf.data());
           glEnd();
           initialize_lit();
           update_mat_color(mesh_color);
         } else {
           // draw as cylinder
           maybe_update_mat_diffuse(usedefaultcolor ? default_diffuse_color : s_color[s1->getVAttribute()]);
-          cyl.draw(vj, vk, rad);
+          cyl.draw(vj.cast<float>(), vk.cast<float>(), rad);
         }
       }
     }
@@ -4433,8 +4446,8 @@ void draw_sc() {
     glBegin(GL_LINES);
     for (Simplex s : Kmesh.simplices_dim(1)) {
       update_cur_color(s->hasColor() ? s_color[s->getVAttribute()] : pix_edgecolor);
-      Point p0 = s->getChild(0)->getPosition();
-      Point p1 = s->getChild(1)->getPosition();
+      Point p0 = s->getChild(0)->getPosition().cast<float>();
+      Point p1 = s->getChild(1)->getPosition().cast<float>();
       glVertex3fv(p0.data());
       glVertex3fv(p1.data());
     }
@@ -4592,18 +4605,21 @@ void draw_sc_gm(const SimplicialComplex& kmesh) {
       v0 = verts[0];
       v1 = verts[1];
       v2 = verts[2];
-      const Point& p0 = v0->getPosition();
-      const Point& p1 = v1->getPosition();
-      const Point& p2 = v2->getPosition();
+      const Pointd& p0 = v0->getPosition();
+      const Pointd& p1 = v1->getPosition();
+      const Pointd& p2 = v2->getPosition();
+      const Point p0f = p0.cast<float>();
+      const Point p1f = p1.cast<float>();
+      const Point p2f = p2.cast<float>();
       const Vector& n0 = corner_pnor[3 * s2->getId()];
       const Vector& n1 = corner_pnor[3 * s2->getId() + 1];
       const Vector& n2 = corner_pnor[3 * s2->getId() + 2];
       glNormal3fv(n0.data());
-      glVertex3fv(p0.data());
+      glVertex3fv(p0f.data());
       glNormal3fv(n1.data());
-      glVertex3fv(p1.data());
+      glVertex3fv(p1f.data());
       glNormal3fv(n2.data());
-      glVertex3fv(p2.data());
+      glVertex3fv(p2f.data());
     }
     glEnd();
     // draw all 1-simplices with no parents
@@ -4614,16 +4630,16 @@ void draw_sc_gm(const SimplicialComplex& kmesh) {
       for (Simplex s1 : kmesh.simplices_dim(1)) {
         if (s1->getArea() < 1e-3f) continue;
         psc_orphan_nedges++;
-        const Point& vj = s1->getChild(0)->getPosition();
-        const Point& vk = s1->getChild(1)->getPosition();
+        const Pointd& vj = s1->getChild(0)->getPosition();
+        const Pointd& vk = s1->getChild(1)->getPosition();
         float area = s1->getArea();
         assertx(area >= 0.f);
         // radius of a cylinder from vj to vk with same area
         float rad;
-        float height = dist(vj, vk);
+        float height = static_cast<float>(dist(vj, vk));
         rad = area / (TAU * height);
         // cylinder center
-        const Point& center = interp(vj, vk);
+        const Pointd center = interp(vj, vk);
         if (height < 2.f * rad) {
           // draw as point
           maybe_update_mat_diffuse(s_color[s1->getVAttribute()]);
@@ -4641,15 +4657,17 @@ void draw_sc_gm(const SimplicialComplex& kmesh) {
           update_cur_color(s_color[s1->getVAttribute()]);
           set_thickness(thickness);
           glBegin(GL_LINES);
-          glVertex3fv(vj.data());
-          glVertex3fv(vk.data());
+          const Point vjf = vj.cast<float>();
+          const Point vkf = vk.cast<float>();
+          glVertex3fv(vjf.data());
+          glVertex3fv(vkf.data());
           glEnd();
           initialize_lit();
           update_mat_color(mesh_color);
         } else {
           // draw as cylinder
           maybe_update_mat_diffuse(s_color[s1->getVAttribute()]);
-          cyl.draw(vj, vk, rad);
+          cyl.draw(vj.cast<float>(), vk.cast<float>(), rad);
         }
       }
     }
@@ -4674,8 +4692,8 @@ void draw_sc_gm(const SimplicialComplex& kmesh) {
     glBegin(GL_LINES);
     for (Simplex s : kmesh.simplices_dim(1)) {
       update_cur_color(s->hasColor() ? s_color[s->getVAttribute()] : pix_edgecolor);
-      Point p0 = s->getChild(0)->getPosition();
-      Point p1 = s->getChild(1)->getPosition();
+      Point p0 = s->getChild(0)->getPosition().cast<float>();
+      Point p1 = s->getChild(1)->getPosition().cast<float>();
       glVertex3fv(p0.data());
       glVertex3fv(p1.data());
     }

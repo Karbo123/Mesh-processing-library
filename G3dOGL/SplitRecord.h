@@ -9,7 +9,7 @@ namespace hh {
 struct AreaData {
   int dim;
   int id;
-  float area;
+  double area;
 };
 
 class SplitRecord {
@@ -38,7 +38,7 @@ class SplitRecord {
   int getVs() const { return _vsid; }
   int getVt() const { return _vtid; }
   int vsp() const { return _pos_bit; }
-  const Point& getDeltap() const { return _deltap; }
+  const Pointd& getDeltap() const { return _deltap; }
 
   // meaningful after applyGMSplit
   const std::vector<Simplex>& getNewFacets() const { return new_facets; }
@@ -61,7 +61,7 @@ class SplitRecord {
   int _vtid;
   Array<int> _outcome;
   int _pos_bit;
-  Point _deltap;
+  Pointd _deltap;
   Array<MaterialData> _material;
   Array<AreaData> _area;
 

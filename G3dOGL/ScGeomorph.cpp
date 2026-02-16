@@ -246,13 +246,14 @@ void ScGeomorph::read(std::istream& is) {
     vnew[v->getId()] = v->getPosition();
 
     // old pos
-    Point& opos = vold[v->getId()];
-    assertx(parse_key_vec(v->get_string(), "Opos", opos));
+    Point oposf;
+    assertx(parse_key_vec(v->get_string(), "Opos", oposf));
+    vold[v->getId()] = Pointd(oposf[0], oposf[1], oposf[2]);
 
     // old area
     const char* soa = GMesh::string_key(str, v->get_string(), "Oarea");
     if (soa) {
-      float area = to_float(soa);
+      double area = to_double(soa);
       aold.enter(v, area);
 
       // old material
@@ -264,7 +265,7 @@ void ScGeomorph::read(std::istream& is) {
     if (v->isPrincipal()) {
       if (0) {
         const char* sna = assertx(GMesh::string_key(str, v->get_string(), "Narea"));
-        float area = to_float(sna);
+        double area = to_double(sna);
         anew.enter(v, area);
       } else {
         anew.enter(v, v->getArea());
@@ -277,7 +278,7 @@ void ScGeomorph::read(std::istream& is) {
     // old area
     const char* soa = GMesh::string_key(str, e->get_string(), "Oarea");
     if (soa) {
-      float area = to_float(soa);
+      double area = to_double(soa);
       aold.enter(e, area);
 
       // old material
@@ -288,7 +289,7 @@ void ScGeomorph::read(std::istream& is) {
     if (e->isPrincipal()) {
       if (0) {
         const char* sna = assertx(GMesh::string_key(str, e->get_string(), "Narea"));
-        float area = to_float(sna);
+        double area = to_double(sna);
         anew.enter(e, area);
       } else {
         anew.enter(e, e->getArea());
@@ -312,7 +313,8 @@ void ScGeomorph::read(std::istream& is) {
   for (Simplex f : K.simplices_dim(2)) {
     Simplex v[3];
     f->vertices(v);
-    fct_pnor[f->getId()] = ok_normalized(cross(v[0]->getPosition(), v[1]->getPosition(), v[2]->getPosition()));
+    fct_pnor[f->getId()] = ok_normalized(cross(v[0]->getPosition(), v[1]->getPosition(), v[2]->getPosition())
+                                             .template cast<float>());
   }
 
   for (Simplex f : K.simplices_dim(2)) {
@@ -333,21 +335,21 @@ void ScGeomorph::update(float alpha, ArrayView<Vector> corner_nors) {  // alpha 
   // this avoids subtle numerical differences due to floating-point operation order.
   std::sort(anew_keys.begin(), anew_keys.end(), SimplexIdCompare());
   for (Simplex s : anew_keys) {
-    float narea = anew.get(s);
+    double narea = anew.get(s);
     assertx(s->isPrincipal());
-    float oarea = 0.f;
+    double oarea = 0.0;
     if (aold.contains(s)) oarea = aold.get(s);
-    s->setArea(alpha * narea + (1.f - alpha) * oarea);
+    s->setArea(static_cast<double>(alpha) * narea + (1.0 - static_cast<double>(alpha)) * oarea);
   }
 
   Array<Simplex> aold_keys(aold.keys());
   // sort old area keys to maintain determinism.
   std::sort(aold_keys.begin(), aold_keys.end(), SimplexIdCompare());
   for (Simplex s : aold_keys) {
-    float oarea = aold.get(s);
+    double oarea = aold.get(s);
     // handled by anew
     if (!s->isPrincipal()) {
-      s->setArea((1.f - alpha) * oarea);
+      s->setArea((1.0 - static_cast<double>(alpha)) * oarea);
       s->setVAttribute(mold.get(s));
     }
   }

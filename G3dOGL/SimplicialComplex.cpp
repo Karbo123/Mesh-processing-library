@@ -1,6 +1,7 @@
 // -*- C++ -*-  Copyright (c) Microsoft Corporation; see license.txt
 #include "G3dOGL/SimplicialComplex.h"
 
+#include <iomanip>
 #include <map>
 
 #include "libHh/RangeOp.h"  // compare()
@@ -9,6 +10,7 @@
 #include "libHh/StringOp.h"
 
 #ifdef BUILD_LIBPSC
+#include "G3dOGL/Contractor.hpp"
 #include "G3dOGL/SplitRecord.h"
 #endif
 
@@ -16,8 +18,8 @@ namespace hh {
 
 namespace {
 
-constexpr float k_tolerance = 1e-6f;     // scalar attribute equality tolerance
-constexpr float k_undefined = BIGFLOAT;  // undefined scalar attributes
+constexpr double k_tolerance = 1e-12;                          // scalar attribute equality tolerance
+constexpr double k_undefined = static_cast<double>(BIGFLOAT);  // undefined scalar attributes
 HH_STAT(Sarea_dropped);
 HH_STAT(Sarea_moved);
 
@@ -89,12 +91,12 @@ void ISimplex::polygon(Polygon& poly) const {
   Simplex s1;
   poly.init(0);
   s0[0] = getChild(0)->getChild(0);
-  poly.push(s0[0]->getPosition());
+  poly.push(s0[0]->getPosition().cast<float>());
   s0[1] = getChild(0)->getChild(1);
-  poly.push(s0[1]->getPosition());
+  poly.push(s0[1]->getPosition().cast<float>());
   s1 = getChild(1);
   const int child_index = s1->getChild(0) != s0[0] && s1->getChild(0) != s0[1] ? 0 : 1;
-  poly.push(s1->getChild(child_index)->getPosition());
+  poly.push(s1->getChild(child_index)->getPosition().cast<float>());
   return;
 }
 
@@ -338,8 +340,6 @@ bool SimplicialComplex::eq2simp(Simplex s1, Simplex s2) const {
 void SimplicialComplex::unify(Simplex vs, Simplex vt, int propagate_area, MinHeap* heap) {
   assertx(vs->getDim() == 0 && vt->getDim() == 0);
 
-  // keep the map using default pointer comparison because it contains dangling pointers
-  // after destroySimplex() calls; dereferencing those in a comparator would be undefined.
   std::map<Simplex, int> modified_simplices;
   if (heap) {
     for (auto v : {vs, vt}) {
@@ -371,7 +371,7 @@ void SimplicialComplex::unify(Simplex vs, Simplex vt, int propagate_area, MinHea
     if (vs->getParents().size() == 1) vs->setVAttribute(both->getVAttribute());
   }
 
-  float cmp_area = 0.f;
+  double cmp_area = 0.0;
 
   if (propagate_area) {
     for (Simplex s : vs->get_star()) {
@@ -619,6 +619,9 @@ void SimplicialComplex::replace(Simplex src, Simplex tgt, Stack<Simplex>& affect
 }
 
 void SimplicialComplex::write(std::ostream& os) const {
+  const auto old_precision = os.precision();
+  os << std::setprecision(17);
+
   // dump materials
 
   if (_material_strings.num()) {
@@ -632,7 +635,7 @@ void SimplicialComplex::write(std::ostream& os) const {
     for (Simplex s : this->ordered_simplices_dim(dim)) {
       os << "Simplex " << dim << " " << s->getId() << "  ";
       if (dim == 0) {
-        Point pos = s->getPosition();
+        Pointd pos = s->getPosition();
         os << " " << pos[0] << " " << pos[1] << " " << pos[2];
       } else {  // dim != 0
         // iterate over children
@@ -654,13 +657,15 @@ void SimplicialComplex::write(std::ostream& os) const {
 
       if (s->isPrincipal()) {
         if (!out.empty()) out += " ";
-        out += sform("area=%g", s->getArea());
+        out += sform("area=%.17g", s->getArea());
       }
 
       if (!out.empty()) os << "  {" << out << "}";
       assertx(os << "\n");
     }
   }
+
+  os << std::setprecision(old_precision);
 }
 
 void SimplicialComplex::read(std::istream& is) {
@@ -705,8 +710,8 @@ void SimplicialComplex::readLine(const char* str) {
     // read and update children pointers
     if (dim == 0) {
       // read position
-      Point pos;
-      for_int(i, 3) pos[i] = float_from_chars(s);
+      Pointd pos;
+      for_int(i, 3) pos[i] = double_from_chars(s);
       sd->setPosition(pos);
     } else {  // dim != 0
       // read connectivity
@@ -729,7 +734,7 @@ void SimplicialComplex::readLine(const char* str) {
     if (attrid) sd->setVAttribute(to_int(attrid));
 
     const char* area = GMesh::string_key(str2, va_field, "area");
-    if (area) sd->setArea(to_float(area));
+    if (area) sd->setArea(to_double(area));
     return;
   }
   if (const char* s = after_prefix(sline, "Unify ")) {
@@ -751,61 +756,6 @@ void SimplicialComplex::attrReadLine(const char* str) {
 void SimplicialComplex::skeleton(int dim) {
   if (dim + 1 > MAX_DIM) return;
   for (Simplex s : Array<Simplex>{this->simplices_dim(dim + 1)}) destroySimplex(s);
-}
-
-// Read triangulation produced by quick hull and extend this SC with such triangulation.
-void SimplicialComplex::readQHull(std::istream& is) {
-  int n;
-  assertx(is >> n);
-  is >> std::ws;
-
-  assertx(num(1) == 0);
-
-  // verts might not be numbered in order
-  Map<int, Simplex> id2vtx;
-  int verts;
-  {
-    int i = 0;
-    for (Simplex v : this->ordered_simplices_dim(0)) {
-      id2vtx.enter(i, v);
-      i++;
-    }
-    verts = num(0);
-    assertx(i == verts);
-  }
-
-  // for all facets for triangulation
-  string line;
-  for_int(i, n) {
-    if (!my_getline(is, line)) break;
-    Vec4<int> v;
-    const char* s = line.c_str();
-    for_int(k, 4) v[k] = int_from_chars(s);
-    assert_no_more_chars(s);
-    for_int(j, 3) {
-      if (v[j] >= verts) continue;
-
-      for_intL(k, j + 1, 4) {
-        if (v[k] >= verts) continue;
-
-        Simplex vs = id2vtx.get(v[j]);
-        Simplex vt = id2vtx.get(v[k]);
-        assertx(vs && vt);
-
-        // if there isn't already an edge, create one
-        if (!vs->edgeTo(vt)) {
-          Simplex e = createSimplex(1);
-          assertx(e);
-
-          e->setVAttribute(1);
-          e->setChild(0, vs);
-          e->setChild(1, vt);
-          vs->addParent(e);
-          vt->addParent(e);
-        }
-      }
-    }
-  }
 }
 
 #if 0
@@ -852,7 +802,8 @@ void SimplicialComplex::readGMesh(std::istream& is) {
     v2s0.enter(v, s0);
     // no children
     // parent updated later when its created
-    s0->setPosition(mesh.point(v));
+    const Point& pt = mesh.point(v);
+    s0->setPosition(Pointd(pt[0], pt[1], pt[2]));
 
     // compute normals
     Vnors vnors(mesh, v);
@@ -968,8 +919,22 @@ Simplex SimplicialComplex::createSimplex(int dim, int id) {
 #ifdef BUILD_LIBPSC
 
 /* perform simplicial complex simplification, until a single vertex */
-std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> SimplicialComplex::perform_simplification(
-    bool markov) {
+std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>>
+SimplicialComplex::perform_simplification(bool markov) {
+  // update "_total_initial_vertices"
+  _total_initial_vertices = 0;
+  for (auto v : ordered_simplices_dim(0)) {
+    _total_initial_vertices += v->_subtree_size;
+  }
+
+  // in markov mode, update boundary edge weightings first
+  if (markov) {
+    // iterate through all edges
+    for (auto e : ordered_simplices_dim(1)) {
+      update_boundary_edge_weighting_(e);
+    }
+  }
+
   // compute quadric for each simplex
   for (int d : {0, 1, 2}) {
     for (auto s : ordered_simplices_dim(d)) {
@@ -985,63 +950,24 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
   // the min heap
   MinHeap heap;
 
-  // compute all possible candidate pairs for contraction
-  auto candidate_pairs = compute_candidate_pairs();
-
-  // construct the candidate pairs as a simplicial complex as well
-  SimplicialComplex sc_candi_pairs;
-  for (auto [idx_v0, idx_v1] : candidate_pairs) {
-    // create the first endpoint
-    auto v0 = sc_candi_pairs.getSimplex(0, idx_v0);
-    if (v0 == nullptr) {
-      v0 = sc_candi_pairs.createSimplex(0, idx_v0);
-      v0->setPosition(getSimplex(0, idx_v0)->getPosition());
-    }
-
-    // create the second endpoint
-    auto v1 = sc_candi_pairs.getSimplex(0, idx_v1);
-    if (v1 == nullptr) {
-      v1 = sc_candi_pairs.createSimplex(0, idx_v1);
-      v1->setPosition(getSimplex(0, idx_v1)->getPosition());
-    }
-
-    // must not exist
-    assertx(v0->edgeTo(v1) == nullptr);
-    assertx(v1->edgeTo(v0) == nullptr);
-
-    // create the contraction pair
-    auto e = sc_candi_pairs.createSimplex(1);
-
-    // set the connectivity
-    e->setChild(0, v0);
-    e->setChild(1, v1);
-    v0->addParent(e);
-    v1->addParent(e);
-
-    // compute contraction cost and new location
-    //   subtree depths are initially 1 for each vertex (already initialized in ISimplex)
-    std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(idx_v0, idx_v1);
-
-    // add to heap
-    assertx(heap.insert(e));
-  }
+  // useful for edge collapse
+  Contractor contractor(*this, heap, markov);
 
   // all the edge collapse recordings
   std::vector<EcolRecord> ecol_record_lst;
 
   // see if this is a valid vertex unification
-  auto is_valid_ecol = [&](int vsid, int vtid, Point p_new) -> bool {
+  auto is_valid_ecol = [&](int vsid, int vtid, Pointd p_new) -> bool {
     Simplex vs = getSimplex(0, vsid);
     Simplex vt = getSimplex(0, vtid);
     auto face_s = vs->faces_of_vertex();
     auto face_t = vt->faces_of_vertex();
-    // use simplexidcompare to ensure deterministic set operations.
-    std::set<Simplex, SimplexIdCompare> face_set_s(face_s.begin(), face_s.end());
-    std::set<Simplex, SimplexIdCompare> face_set_t(face_t.begin(), face_t.end());
+    std::set<Simplex> face_set_s(face_s.begin(), face_s.end());
+    std::set<Simplex> face_set_t(face_t.begin(), face_t.end());
 
     // symmetric difference
-    std::set<Simplex, SimplexIdCompare> affected_faces = [&] {
-      std::set<Simplex, SimplexIdCompare> result;
+    std::set<Simplex> affected_faces = [&] {
+      std::set<Simplex> result;
       for (auto f : face_set_s)
         if (!face_set_t.count(f)) result.insert(f);
       for (auto f : face_set_t)
@@ -1050,7 +976,7 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     }();
 
     // get vertex position (possibly replaced)
-    auto get_v_pos = [&](Simplex v, bool replace = true) {
+    auto get_v_pos = [&](Simplex v, bool replace = true) -> Pointd {
       assertx(v->getDim() == 0);
       if (replace) {
         int vid = v->getId();
@@ -1062,27 +988,27 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     };
 
     // get face normals
-    auto get_f_nor = [&](Simplex f, bool replace = true) {
+    auto get_f_nor = [&](Simplex f, bool replace = true) -> Pointd {
       assertx(f->getDim() == 2);
       Simplex v012[3];
       f->vertices(v012);
-      Point v0 = get_v_pos(v012[0], replace);
-      Point v1 = get_v_pos(v012[1], replace);
-      Point v2 = get_v_pos(v012[2], replace);
-      Point u = v1 - v0;
-      Point v = v2 - v0;
-      Point normals = cross(u, v);
+      Pointd v0 = get_v_pos(v012[0], replace);
+      Pointd v1 = get_v_pos(v012[1], replace);
+      Pointd v2 = get_v_pos(v012[2], replace);
+      Pointd u = v1 - v0;
+      Pointd v = v2 - v0;
+      Pointd normals = cross(u, v);
       normals.normalize();
       return normals;
     };
 
     // compute original face normals
     for (Simplex f : affected_faces) {
-      Point nor_before = get_f_nor(f, false);
-      Point nor_after = get_f_nor(f, true);
+      Pointd nor_before = get_f_nor(f, false);
+      Pointd nor_after = get_f_nor(f, true);
       // detect flipped faces
       //   the threshold is from: https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification/blob/65df07dc54766e3ee480482f1c881a62767831cc/src.gl/Simplify.h#L219
-      if (dot(nor_before, nor_after) < 0.2f) {
+      if (dot(nor_before, nor_after) < 0.2) {
         return false;
       }
     }
@@ -1095,7 +1021,7 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
   };
 
   // the list of contraction costs
-  std::vector<float> cost_lst;
+  std::vector<double> cost_lst;
 
   // for loop, until only one vertex left
   while (!heap.empty()) {
@@ -1103,12 +1029,20 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     Simplex pair = heap.min();
     assertx(pair->getDim() == 1);
 
+    // lazy invalidation is only enabled in markov mode.
+    // non-markov branch relies on a stronger invariant that every edge in
+    // _edge_graph star(vs) is present in _heap before local recomputation.
+    if (markov && !contractor.is_valid_candidate(pair)) {
+      assertx(heap.erase(pair));
+      continue;
+    }
+
     // get the values
-    float cost = pair->cost;
+    double cost = pair->cost;
     int vsid = pair->getChild(0)->getId();
     int vtid = pair->getChild(1)->getId();
-    float w_p0 = pair->w_p0;
-    if (w_p0 == 0.0f) {
+    double w_p0 = pair->w_p0;
+    if (w_p0 == 0.0) {
       std::swap(vsid, vtid);
     }
 
@@ -1116,17 +1050,17 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     Simplex vt = getSimplex(0, vtid);
 
     // compute new location
-    Point delta_p = vt->getPosition() - vs->getPosition();
-    if (w_p0 == 0.5f) {
-      delta_p *= 0.5f;
+    Pointd delta_p = vt->getPosition() - vs->getPosition();
+    if (w_p0 == 0.5) {
+      delta_p *= 0.5;
     }
-    Point p_new = vt->getPosition() - delta_p;
+    Pointd p_new = vt->getPosition() - delta_p;
 
     // see if it will cause flipped faces
-    constexpr float FP32_INF = std::numeric_limits<float>::max();
-    if (cost < FP32_INF && !is_valid_ecol(vsid, vtid, p_new)) {
+    constexpr double FP64_INF = std::numeric_limits<double>::max();
+    if (cost < FP64_INF && !is_valid_ecol(vsid, vtid, p_new)) {
       assertx(heap.erase(pair));
-      pair->cost = FP32_INF;  // penalize such a collapse
+      pair->cost = FP64_INF;  // penalize such a collapse
       assertx(heap.insert(pair));
       continue;
     }
@@ -1138,107 +1072,8 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     // update source position, because we will later unify and discard "vt"
     vs->setPosition(p_new);
 
-    if (_recompute_component_ids) {
-      // fully recompute connected components
-      //   a little bit slower
-      compute_connected_components_();  // >= v0.2.1
-    } else {
-      // the old manner, for backward compatibility
-      //   old manner, wrong for some cases
-      //   for example, four points and two components [A=0, B=0, C=1, D=1]
-      //   we collapse C into B, obtain [A=0, B=1, C=1, D=1]
-      //   meaning A and B are still disconnected
-      //   but actually A~D are all connected now
-      vs->_component_id = vt->_component_id;  // v0.2
-    }
-
-    if (!markov) {
-      ISimplex::add_quadric_(vs, vt);
-    }
-
-    // unify the two vertices (do not destroy "v1")
-    unify(vs, vt);
-
-    // the sc of candidate pairs
-    //   update subtree depth: the merged vertex inherits 1 + max(depths)
-    Simplex vs_candi = sc_candi_pairs.getSimplex(0, vsid);
-    Simplex vt_candi = sc_candi_pairs.getSimplex(0, vtid);
-    int new_subtree_depth = 1 + std::max(vs_candi->_subtree_depth, vt_candi->_subtree_depth);
-    int new_subtree_size = vs_candi->_subtree_size + vt_candi->_subtree_size;
-    sc_candi_pairs.unify(vs_candi, vt_candi, 0, &heap);
-    //   after unify, vs_candi survives, so update its subtree depth
-    vs_candi->_subtree_depth = new_subtree_depth;
-    vs_candi->_subtree_size = new_subtree_size;
-    vs->_subtree_depth = new_subtree_depth;
-    vs->_subtree_size = new_subtree_size;
-
-    if (markov) {
-      // collect all affected vertices (need to update their aggregated quadrics)
-      // they are: vs itself, and all vertices that share an edge with vs.
-      // use simplexidcompare to ensure deterministic iteration order, so that quadric accumulation results are consistent.
-      std::set<Simplex, SimplexIdCompare> affected_vertices;
-      affected_vertices.insert(vs);
-
-      // for all simplices in vs's star
-      for (auto s : vs->get_star()) {
-        // update native quadrics for vs and all edges/faces in vs's star
-        s->compute_native_quadric_();
-
-        // collect all neighbors of vs (vertices connected via edges)
-        if (s->getDim() == 1) {
-          Simplex oppo = s->opp_vertex(vs);
-          assertx(oppo);
-          affected_vertices.insert(oppo);
-        }
-      }
-
-      // re-aggregate quadrics for all affected vertices
-      for (Simplex v : affected_vertices) {
-        // reset to native quadric first
-        v->compute_native_quadric_();
-        // then aggregate from neighbors
-        v->aggregate_();
-      }
-
-      // update heap for candidate edges involving affected vertices
-      // use simplexidcompare to guarantee deterministic heap update order.
-      std::set<Simplex, SimplexIdCompare> edges_to_update;
-      for (Simplex v : affected_vertices) {
-        int vid = v->getId();
-        Simplex v_candi = sc_candi_pairs.getSimplex(0, vid);
-        assertx(v_candi);
-        for (auto e : v_candi->get_star()) {
-          if (e->getDim() == 0) continue;
-          assertx(e->getDim() == 1);
-          edges_to_update.insert(e);
-        }
-      }
-
-      // re-compute quadrics and costs for affected edges
-      for (Simplex e : edges_to_update) {
-        assertx(heap.erase(e));
-        Simplex c0 = e->getChild(0);
-        Simplex c1 = e->getChild(1);
-        std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(c0->getId(), c1->getId());
-        assertx(heap.insert(e));
-      }
-
-    } else {
-      // re-compute the cost
-      for (auto e : sc_candi_pairs.getSimplex(0, vsid)->get_star()) {
-        if (e->getDim() == 0) continue;
-        assertx(e->getDim() == 1);
-        // update
-        assertx(heap.erase(e));
-        // note :
-        //   the vertex ids are shared
-        //   the quadric information is taken from "this" rather than "sc_candi_pairs"
-        Simplex c0 = e->getChild(0);
-        Simplex c1 = e->getChild(1);
-        std::tie(e->cost, e->w_p0) = compute_contraction_cost_and_location(c0->getId(), c1->getId());
-        assertx(heap.insert(e));
-      }
-    }
+    // perform edge collapse
+    contractor.merge(vsid, vtid);
 
     // append the old cost
     cost_lst.push_back(cost);
@@ -1286,12 +1121,13 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
   }
 
   // the starting location
-  Point starting_point_ = getSimplex(0, start_v_idx)->getPosition();
-  std::array<float, 3> starting_point{starting_point_[0], starting_point_[1], starting_point_[2]};
+  Pointd starting_point_ = getSimplex(0, start_v_idx)->getPosition();
+  std::array<double, 3> starting_point{starting_point_[0], starting_point_[1], starting_point_[2]};
 
   // compute string code by reconstructing the simplicial complex
   SimplicialComplex K_recon;
   std::stringstream ss;
+  ss << std::setprecision(17);
   ss << "Simplex 0 1 " << starting_point[0] << " " << starting_point[1] << " " << starting_point[2] << "\n";
   K_recon.read(ss);
 
@@ -1312,7 +1148,7 @@ std::tuple<std::array<float, 3>, std::vector<py::dict>, std::vector<float>> Simp
     // compute the ordered queue of adjacent simplices
     Pqueue<Simplex> pq[3];
     for (auto s : vs->get_star()) {
-      pq[s->getDim()].enter_unsorted(s, float(s->getId()));
+      pq[s->getDim()].enter_unsorted(s, static_cast<double>(s->getId()));
     }
 
     // to find the topological label for the query simplex
