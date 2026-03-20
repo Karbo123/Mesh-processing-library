@@ -290,9 +290,22 @@ class Contractor {
     // useful for computing cross-component candidate edges
     initialize_component_ids_from_mesh_edges();
 
-    // insert delaunay vertices
-    for (auto v : _mesh.ordered_simplices_dim(0)) {
-      insert_delaunay_vertex(v->getId(), v->getPosition());
+    // insert delaunay vertices in position-sorted order for determinism
+    // (CGAL Delaunay insertion order can affect triangulation for degenerate configs)
+    {
+      std::vector<std::pair<Pointd, int>> pos_id_pairs;
+      for (auto v : _mesh.ordered_simplices_dim(0)) {
+        pos_id_pairs.push_back({v->getPosition(), v->getId()});
+      }
+      std::sort(pos_id_pairs.begin(), pos_id_pairs.end(),
+                [](const auto& a, const auto& b) {
+                  auto ta = std::make_tuple(a.first[0], a.first[1], a.first[2]);
+                  auto tb = std::make_tuple(b.first[0], b.first[1], b.first[2]);
+                  return ta < tb;
+                });
+      for (const auto& [pos, vid] : pos_id_pairs) {
+        insert_delaunay_vertex(vid, pos);
+      }
     }
 
     // derive pairs from:

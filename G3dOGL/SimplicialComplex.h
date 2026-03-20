@@ -364,6 +364,15 @@ class ISimplex : noncopyable {
       Pointd p1 = v012[1]->getPosition();
       Pointd p2 = v012[2]->getPosition();
 
+      // Sort vertices by position to ensure deterministic Gram-Schmidt ordering,
+      // making the quadric computation independent of vertex ID assignment.
+      {
+        auto pos_key = [](const Pointd& q) { return std::make_tuple(q[0], q[1], q[2]); };
+        if (pos_key(p1) < pos_key(p0)) std::swap(p0, p1);
+        if (pos_key(p2) < pos_key(p0)) std::swap(p0, p2);
+        if (pos_key(p2) < pos_key(p1)) std::swap(p1, p2);
+      }
+
       Pointd p = (p0 + p1 + p2) / 3.0;
 
       Pointd u, v;
@@ -402,14 +411,45 @@ class ISimplex : noncopyable {
   void aggregate_() {
     assertx(getDim() == 0);
 
-    // get its neighborhood, including the vertex itself
-    for (auto s : get_star()) {
+    // Sort star simplices by defining vertex positions for deterministic aggregation.
+    // Floating-point addition is not associative, so iteration order matters.
+    auto star = get_star();
+    std::sort(star.begin(), star.end(), [](Simplex a, Simplex b) {
+      if (a->getDim() != b->getDim()) return a->getDim() < b->getDim();
+      // Sort by defining vertex positions lexicographically
+      auto get_pos_key = [](Simplex s) {
+        if (s->getDim() == 0) {
+          const Pointd& p = s->getPosition();
+          return std::array<double, 9>{p[0], p[1], p[2], 0, 0, 0, 0, 0, 0};
+        } else if (s->getDim() == 1) {
+          Pointd p0 = s->getChild(0)->getPosition();
+          Pointd p1 = s->getChild(1)->getPosition();
+          auto t0 = std::make_tuple(p0[0], p0[1], p0[2]);
+          auto t1 = std::make_tuple(p1[0], p1[1], p1[2]);
+          if (t1 < t0) std::swap(p0, p1);
+          return std::array<double, 9>{p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], 0, 0, 0};
+        } else {
+          Simplex v012[3];
+          s->vertices(v012);
+          Pointd p0 = v012[0]->getPosition();
+          Pointd p1 = v012[1]->getPosition();
+          Pointd p2 = v012[2]->getPosition();
+          auto key = [](const Pointd& q) { return std::make_tuple(q[0], q[1], q[2]); };
+          if (key(p1) < key(p0)) std::swap(p0, p1);
+          if (key(p2) < key(p0)) std::swap(p0, p2);
+          if (key(p2) < key(p1)) std::swap(p1, p2);
+          return std::array<double, 9>{p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], p2[0], p2[1], p2[2]};
+        }
+      };
+      return get_pos_key(a) < get_pos_key(b);
+    });
+
+    // Aggregate in deterministic order
+    for (auto s : star) {
       int dim = s->getDim();
       if (dim == 0) {
-        // it is just itself, don't need to add itself
         assertx(s == this);
       } else {
-        // divide by the number of corners
         ISimplex::add_quadric_(this, s, 1.0 / (dim + 1));
       }
     }
@@ -890,6 +930,17 @@ class SimplicialComplex : noncopyable {
       }
     }
 
+    // When both endpoints have equal cost (and are better than midpoint),
+    // use lexicographic position comparison for geometry-deterministic selection.
+    // This ensures the result is independent of vertex ID assignment.
+    if (i_best == 0 || i_best == 1) {
+      double cost_other = evaluate_cost(candidates[1 - i_best]);
+      if (cost_other == cost_min) {
+        auto pos_tuple = [](const Pointd& q) { return std::make_tuple(q[0], q[1], q[2]); };
+        i_best = pos_tuple(candidates[0]) <= pos_tuple(candidates[1]) ? 0 : 1;
+      }
+    }
+
     // fused location is at: p0 * w_p0 + p1 * (1 - w_p0)
     double w_p0;
     if (i_best == 0) {
@@ -949,7 +1000,7 @@ class SimplicialComplex : noncopyable {
        note : because it depends on "SplitRecord", so it is best to move the implementation to the cpp file
   */
   std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>> perform_simplification(
-      bool markov = false);
+      bool markov = false, double voxel_size = 0.0);
 #endif
 };
 

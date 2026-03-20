@@ -920,7 +920,9 @@ Simplex SimplicialComplex::createSimplex(int dim, int id) {
 
 /* perform simplicial complex simplification, until a single vertex */
 std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>>
-SimplicialComplex::perform_simplification(bool markov) {
+SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
+  (void)voxel_size;
+
   // update "_total_initial_vertices"
   _total_initial_vertices = 0;
   for (auto v : ordered_simplices_dim(0)) {
