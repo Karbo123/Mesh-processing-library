@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -51,6 +52,26 @@ class Contractor {
 
   using PairInt = std::pair<int, int>;
 
+  struct PositionKey {
+    std::uint64_t x;
+    std::uint64_t y;
+    std::uint64_t z;
+
+    bool operator==(const PositionKey&) const = default;
+  };
+
+  struct PositionKeyHash {
+    std::size_t operator()(const PositionKey& p) const noexcept {
+      std::size_t h1 = std::hash<std::uint64_t>{}(p.x);
+      std::size_t h2 = std::hash<std::uint64_t>{}(p.y);
+      std::size_t h3 = std::hash<std::uint64_t>{}(p.z);
+      std::size_t h = h1;
+      h ^= h2 + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      h ^= h3 + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+
   struct PairIntHash {
     std::size_t operator()(const PairInt& p) const noexcept {
       std::size_t h1 = std::hash<int>{}(p.first);
@@ -61,6 +82,7 @@ class Contractor {
 
   using PairIntSet = std::unordered_set<PairInt, PairIntHash>;
   using IntSet = std::unordered_set<int>;
+  using PositionBuckets = std::unordered_map<PositionKey, std::vector<int>, PositionKeyHash>;
 
  private:
   // selects the update policy:
@@ -90,6 +112,41 @@ class Contractor {
   static inline PairInt normalize_pair(int a, int b) {
     if (a > b) std::swap(a, b);
     return {a, b};
+  }
+
+  static PositionKey make_position_key(const Pointd& p) {
+    auto canonical_bits = [](double value) {
+      return value == 0.0 ? std::uint64_t{0} : std::bit_cast<std::uint64_t>(value);
+    };
+    return {canonical_bits(p[0]), canonical_bits(p[1]), canonical_bits(p[2])};
+  }
+
+  PositionBuckets build_position_buckets() const {
+    PositionBuckets buckets;
+    buckets.reserve(_mesh.ordered_simplices_dim(0).size());
+    for (auto v : _mesh.ordered_simplices_dim(0)) {
+      buckets[make_position_key(v->getPosition())].push_back(v->getId());
+    }
+    return buckets;
+  }
+
+  template <typename FindRootCached>
+  void append_cross_edges_from_coincident_vertices_for_vertex(int vid, const PositionBuckets& position_buckets,
+                                                              PairIntSet& cross_edges,
+                                                              FindRootCached find_root_cached) {
+    Simplex v = _mesh.getSimplex(0, vid);
+    assertx(v);
+
+    auto it = position_buckets.find(make_position_key(v->getPosition()));
+    if (it == position_buckets.end()) return;
+
+    const int root_vid = find_root_cached(vid);
+    for (int neighbor_vid : it->second) {
+      if (neighbor_vid == vid) continue;
+      if (root_vid != find_root_cached(neighbor_vid)) {
+        cross_edges.insert(normalize_pair(vid, neighbor_vid));
+      }
+    }
   }
 
   void reserve_state_maps(std::size_t vertex_count) {
@@ -149,9 +206,42 @@ class Contractor {
   // precondition: vid is not currently present in _vid2vh_map.
   void insert_delaunay_vertex(int vid, const Pointd& p) {
     Point_3 pt(p[0], p[1], p[2]);
+    auto n_before = _dt.number_of_vertices();
     Vertex_handle vh = _dt.insert(pt);
+
+    if (_dt.number_of_vertices() == n_before) {
+      // CGAL returned an existing handle for a coincident point.
+      // Inserting would create a shared handle (ABA problem): two vids
+      // mapping to the same handle, leading to use-after-free when one
+      // is removed.  Skip Delaunay insertion for this vid; it will still
+      // participate in candidate discovery via mesh edges.
+      return;
+    }
+
     vh->info() = vid;
     _vid2vh_map[vid] = vh;
+  }
+
+  // rebuild delaunay from the current surviving mesh vertices.
+  // this is more conservative than incremental remove/insert, but avoids stale
+  // handle issues on heavily quantized geometries.
+  void rebuild_delaunay_from_mesh() {
+    _dt.clear();
+    _vid2vh_map.clear();
+    _vid2vh_map.reserve(_mesh.ordered_simplices_dim(0).size());
+    std::vector<std::pair<Pointd, int>> pos_id_pairs;
+    pos_id_pairs.reserve(_mesh.ordered_simplices_dim(0).size());
+    for (auto v : _mesh.ordered_simplices_dim(0)) {
+      pos_id_pairs.push_back({v->getPosition(), v->getId()});
+    }
+    std::sort(pos_id_pairs.begin(), pos_id_pairs.end(), [](const auto& a, const auto& b) {
+      auto ta = std::make_tuple(a.first[0], a.first[1], a.first[2]);
+      auto tb = std::make_tuple(b.first[0], b.first[1], b.first[2]);
+      return ta < tb;
+    });
+    for (const auto& [pos, vid] : pos_id_pairs) {
+      insert_delaunay_vertex(vid, pos);
+    }
   }
 
   // collect delaunay edges whose endpoints are in different connected components.
@@ -160,6 +250,7 @@ class Contractor {
     PairIntSet pairs;
     std::unordered_map<int, int> root_cache;
     root_cache.reserve(_mesh.ordered_simplices_dim(0).size());
+    const PositionBuckets position_buckets = build_position_buckets();
     for (auto v : _mesh.ordered_simplices_dim(0)) {
       int vid = v->getId();
       root_cache[vid] = ds_find(vid);
@@ -184,6 +275,12 @@ class Contractor {
         pairs.insert(normalize_pair(vid0, vid1));
       }
     }
+
+    auto find_root_cached = [&](int qid) { return root_cache.at(qid); };
+    for (auto v : _mesh.ordered_simplices_dim(0)) {
+      append_cross_edges_from_coincident_vertices_for_vertex(v->getId(), position_buckets, pairs, find_root_cached);
+    }
+
     return pairs;
   }
 
@@ -231,14 +328,15 @@ class Contractor {
       // ensure vertices exist
       if (!va) {
         va = _edge_graph.createSimplex(0, a);
-        // the position information might be required by "_heap"
-        va->setPosition(_mesh.getSimplex(0, a)->getPosition());
       }
       if (!vb) {
         vb = _edge_graph.createSimplex(0, b);
-        // the position information might be required by "_heap"
-        vb->setPosition(_mesh.getSimplex(0, b)->getPosition());
       }
+
+      // heap ordering uses edge_graph endpoint geometry as a deterministic
+      // tiebreaker, so always resync it from the current mesh state.
+      va->setPosition(_mesh.getSimplex(0, a)->getPosition());
+      vb->setPosition(_mesh.getSimplex(0, b)->getPosition());
 
       // supposed the edge does not exist at first
       assertx(!va->edgeTo(vb));
@@ -270,6 +368,13 @@ class Contractor {
         // force to recompute; the edge may currently be out of heap
         // (logically removed but kept in edge graph for incremental bookkeeping)
         _heap.erase(e);
+        // Resync edge_graph vertex positions from current mesh state so that
+        // CompareByCost coordinate tiebreakers remain consistent with the new cost.
+        Simplex va = _edge_graph.getSimplex(0, a);
+        Simplex vb = _edge_graph.getSimplex(0, b);
+        assertx(va && vb);
+        va->setPosition(_mesh.getSimplex(0, a)->getPosition());
+        vb->setPosition(_mesh.getSimplex(0, b)->getPosition());
         sync_component_ids_for_pair_if_enabled(a, b, sync_enabled);
         std::tie(e->cost, e->w_p0) = _mesh.compute_contraction_cost_and_location(a, b);
         assertx(_heap.insert(e));
@@ -290,23 +395,7 @@ class Contractor {
     // useful for computing cross-component candidate edges
     initialize_component_ids_from_mesh_edges();
 
-    // insert delaunay vertices in position-sorted order for determinism
-    // (CGAL Delaunay insertion order can affect triangulation for degenerate configs)
-    {
-      std::vector<std::pair<Pointd, int>> pos_id_pairs;
-      for (auto v : _mesh.ordered_simplices_dim(0)) {
-        pos_id_pairs.push_back({v->getPosition(), v->getId()});
-      }
-      std::sort(pos_id_pairs.begin(), pos_id_pairs.end(),
-                [](const auto& a, const auto& b) {
-                  auto ta = std::make_tuple(a.first[0], a.first[1], a.first[2]);
-                  auto tb = std::make_tuple(b.first[0], b.first[1], b.first[2]);
-                  return ta < tb;
-                });
-      for (const auto& [pos, vid] : pos_id_pairs) {
-        insert_delaunay_vertex(vid, pos);
-      }
-    }
+    rebuild_delaunay_from_mesh();
 
     // derive pairs from:
     //   tetrahedra edges (bridging different components)
@@ -329,7 +418,7 @@ class Contractor {
   // neighbors are adjacent by at least one tetrahedral edge.
   void append_adjacent_vertices_of_delaunay_to_set(int vid, IntSet& adjacent_vertices) const {
     auto it = _vid2vh_map.find(vid);
-    assertx(it != _vid2vh_map.end());
+    if (it == _vid2vh_map.end()) return;  // vertex not in Delaunay (coincident point)
 
     Vertex_handle vh = it->second;
     std::vector<Vertex_handle> neighbors;
@@ -359,17 +448,12 @@ class Contractor {
 
   // append cross-component delaunay edges incident to vid into cross_edges.
   void append_cross_edges_from_delaunay_for_vertex(int vid, PairIntSet& cross_edges,
-                                                   std::unordered_map<int, int>* root_cache = nullptr) {
+                                                   std::unordered_map<int, int>* root_cache = nullptr,
+                                                   const PositionBuckets* position_buckets = nullptr) {
     auto it = _vid2vh_map.find(vid);
-    assertx(it != _vid2vh_map.end());
 
     Simplex v = _mesh.getSimplex(0, vid);
     assertx(v);
-
-    Vertex_handle vh = it->second;
-    std::vector<Vertex_handle> neighbors;
-    neighbors.reserve(32);
-    _dt.adjacent_vertices(vh, std::back_inserter(neighbors));
 
     auto find_root_cached = [&](int qid) {
       if (!root_cache) return ds_find(qid);
@@ -380,18 +464,29 @@ class Contractor {
       return root;
     };
 
-    const int root_vid = find_root_cached(vid);
-    for (Vertex_handle neighbor_vh : neighbors) {
-      if (_dt.is_infinite(neighbor_vh)) continue;
-      int neighbor_vid = neighbor_vh->info();
-      assertx(neighbor_vid != vid);
+    if (it != _vid2vh_map.end()) {
+      Vertex_handle vh = it->second;
+      std::vector<Vertex_handle> neighbors;
+      neighbors.reserve(32);
+      _dt.adjacent_vertices(vh, std::back_inserter(neighbors));
 
-      Simplex neighbor_v = _mesh.getSimplex(0, neighbor_vid);
-      assertx(neighbor_v);
+      const int root_vid = find_root_cached(vid);
+      for (Vertex_handle neighbor_vh : neighbors) {
+        if (_dt.is_infinite(neighbor_vh)) continue;
+        int neighbor_vid = neighbor_vh->info();
+        assertx(neighbor_vid != vid);
 
-      if (root_vid != find_root_cached(neighbor_vid)) {
-        cross_edges.insert(normalize_pair(vid, neighbor_vid));
+        Simplex neighbor_v = _mesh.getSimplex(0, neighbor_vid);
+        assertx(neighbor_v);
+
+        if (root_vid != find_root_cached(neighbor_vid)) {
+          cross_edges.insert(normalize_pair(vid, neighbor_vid));
+        }
       }
+    }
+
+    if (position_buckets) {
+      append_cross_edges_from_coincident_vertices_for_vertex(vid, *position_buckets, cross_edges, find_root_cached);
     }
   }
 
@@ -484,8 +579,9 @@ class Contractor {
       affected_edges.reserve(std::max<std::size_t>(affected_edges.bucket_count(), affected_verts.size() * 8));
       std::unordered_map<int, int> root_cache;
       root_cache.reserve(affected_verts.size() * 2);
+      const PositionBuckets position_buckets = build_position_buckets();
       for (int vid : affected_verts) {
-        append_cross_edges_from_delaunay_for_vertex(vid, affected_edges, &root_cache);
+        append_cross_edges_from_delaunay_for_vertex(vid, affected_edges, &root_cache, &position_buckets);
       }
       PairIntSet mesh_edges;
       collect_adjacent_edges_from_mesh(affected_verts, mesh_edges);
@@ -498,7 +594,8 @@ class Contractor {
     PairIntSet affected_edges_before;
     collect_affected_edges_from_vertices(affected_verts_before, affected_edges_before);
 
-    collapse_fn(vsid, vtid);  // perform the collapse ("vt" will be removed)
+    // perform the collapse with incremental Delaunay updates
+    collapse_fn(vsid, vtid, true);
 
     // keep a consistent comparison domain across pre/post states:
     // start from pre-collapse closure, remove deleted vertex, and merge in
@@ -610,6 +707,13 @@ class Contractor {
     // virtual candidates must stay cross-component
     if (ds_find(a) == ds_find(b)) {
       return false;
+    }
+
+    // Exact coincident vertices are a valid geometric candidate even when one
+    // endpoint is not present in Delaunay because insertion reused an existing
+    // handle for that position.
+    if (make_position_key(va->getPosition()) == make_position_key(vb->getPosition())) {
+      return true;
     }
 
     // and remain adjacent in current delaunay triangulation
@@ -848,6 +952,8 @@ class Contractor {
         Simplex c1 = e->getChild(1);
         int id0 = c0->getId();
         int id1 = c1->getId();
+        c0->setPosition(_mesh.getSimplex(0, id0)->getPosition());
+        c1->setPosition(_mesh.getSimplex(0, id1)->getPosition());
         sync_component_ids_for_pair_if_enabled(id0, id1, sync_enabled);
         // recompute using the actual current edge endpoints.
         // using vt_copy here would be incorrect because vt may no longer be incident to this edge.

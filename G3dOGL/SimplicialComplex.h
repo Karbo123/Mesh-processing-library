@@ -10,15 +10,12 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef BUILD_LIBPSC
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <limits>
 #include <sstream>
 namespace py = pybind11;
-#endif
 
-#include "libHh/A3dStream.h"
 #include "libHh/Flags.h"
 #include "libHh/GMesh.h"
 #include "libHh/Map.h"
@@ -45,6 +42,14 @@ inline void orthogonalize_(Pointd& v0, Pointd& v1) {
   v0.normalize();
   v1 = v1 - dot(v0, v1) * v0;
   v1.normalize();
+}
+
+inline bool is_degenerate_segment_(const Pointd& p0, const Pointd& p1, double eps = 1e-15) {
+  return mag2(p1 - p0) <= eps;
+}
+
+inline bool is_degenerate_triangle_(const Pointd& p0, const Pointd& p1, const Pointd& p2, double eps = 1e-15) {
+  return mag2(cross(p1 - p0, p2 - p0)) <= eps;
 }
 
 // compute bounding edges of the (non-degenerate) convex hull of four input points
@@ -186,14 +191,12 @@ class ISimplex : noncopyable {
   // 0-dim simplex has _child[0] which is ignored
   ISimplex(int dim, int id) : _dim(dim), _id(id) {
     for_int(i, _dim + 1) _child[i] = nullptr;
-#ifdef BUILD_LIBPSC
     if (dim == 2) {
       // default:
       //   for verts, edges ==> 0.0
       //   for faces        ==> 1.0
       _weighting_quadric = 1.0;
     }
-#endif
   }
 
   void setChild(int num, Simplex child);
@@ -269,7 +272,6 @@ class ISimplex : noncopyable {
   // for geomorph
   unique_ptr<char[]> _string;
 
-#ifdef BUILD_LIBPSC
  public:
   // for contraction edges only
   //   we store the information in edges of a separate simplicial complex
@@ -291,6 +293,12 @@ class ISimplex : noncopyable {
 
   // the volume weighting for quadric, setting to negative to disable
   double _weighting_quadric = 0.0;
+
+  // True when the vertex position was synthesized by voxel collision resolution
+  // or by a midpoint collapse in voxel mode. Such vertices are harder to replay
+  // losslessly through endpoint/midpoint-only split records, so later midpoint
+  // collapses involving them are conservatively disabled.
+  bool _voxel_displaced = false;
 
   /* add two quadrics: q = a + b (double precision) */
   static void add_quadric_(Simplex q, const Simplex a, double w = 1.0) {
@@ -375,9 +383,16 @@ class ISimplex : noncopyable {
 
       Pointd p = (p0 + p1 + p2) / 3.0;
 
-      Pointd u, v;
-      u = p1 - p0;
-      v = p2 - p0;
+      if (is_degenerate_triangle_(p0, p1, p2)) {
+        const Pointd zero_point(0.0, 0.0, 0.0);
+        _A = {zero_point, zero_point, zero_point};
+        _b = zero_point;
+        _c = 0.0;
+        return;
+      }
+
+      Pointd u = p1 - p0;
+      Pointd v = p2 - p0;
       orthogonalize_(u, v);
 
       // A = I - sum(tangent_i * tangent_i^T)
@@ -416,7 +431,6 @@ class ISimplex : noncopyable {
     auto star = get_star();
     std::sort(star.begin(), star.end(), [](Simplex a, Simplex b) {
       if (a->getDim() != b->getDim()) return a->getDim() < b->getDim();
-      // Sort by defining vertex positions lexicographically
       auto get_pos_key = [](Simplex s) {
         if (s->getDim() == 0) {
           const Pointd& p = s->getPosition();
@@ -444,7 +458,6 @@ class ISimplex : noncopyable {
       return get_pos_key(a) < get_pos_key(b);
     });
 
-    // Aggregate in deterministic order
     for (auto s : star) {
       int dim = s->getDim();
       if (dim == 0) {
@@ -454,14 +467,13 @@ class ISimplex : noncopyable {
       }
     }
   }
-#endif
 };
-
-#ifdef BUILD_LIBPSC
 
 struct TopoRecord {
   DefiningVertIds defining_vertex_ids;
   int label;  // topological label
+  int dim;
+  int simplex_id;
 };
 
 /* see if these three vertex can constitute a face simplex */
@@ -513,8 +525,6 @@ inline DefiningVertIds compute_defining_vertex_ids(Simplex s) {
     return out;
   }
 }
-
-#endif
 
 // this is useful for getting the edge pair with minimal cost, or querying the existence
 class MinHeap {
@@ -586,8 +596,15 @@ class MinHeap {
       }
     }
 
+    static std::pair<int, int> make_canonical_edge_key_by_ids(Simplex e) {
+      assertx(e && e->getDim() == 1);
+      int id0 = e->getChild(0)->getId();
+      int id1 = e->getChild(1)->getId();
+      if (id0 > id1) std::swap(id0, id1);
+      return {id0, id1};
+    }
+
     bool operator()(Simplex a, Simplex b) const {
-#ifdef BUILD_LIBPSC
       if (a == b) {
         return false;
       }
@@ -608,15 +625,10 @@ class MinHeap {
         return a_key_coord < b_key_coord;
       }
 
-      assertnever(
-          "Degenerate candidate edges detected: two distinct edges share identical endpoint coordinates. "
-          "This usually indicates duplicated/overlapping vertex positions. "
-          "Please preprocess input mesh to remove coincident vertices.");
-      return false;
-#else
-      // dummy
-      return true;
-#endif
+      // In voxel mode, later collapses may legitimately create distinct edges whose
+      // endpoints occupy the same coordinates. Fall back to the current endpoint ids
+      // so heap ordering remains deterministic on identical canonicalized inputs.
+      return make_canonical_edge_key_by_ids(a) < make_canonical_edge_key_by_ids(b);
     }
   };
 
@@ -645,7 +657,6 @@ class SimplicialComplex : noncopyable {
   void clear();
 
   // I/O
-  void readGMesh(std::istream& is);
   void read(std::istream& is);
   void write(std::ostream& os) const;
 
@@ -702,7 +713,6 @@ class SimplicialComplex : noncopyable {
   Array<string> _material_strings;
   Vec<int, MAX_DIM + 1> _free_sid;
 
-#ifdef BUILD_LIBPSC
  public:
   //  the multiplicative factor for the cost if the vertices are from different components
   double _weighting_topo = 1.0;
@@ -723,6 +733,10 @@ class SimplicialComplex : noncopyable {
   // the weighting for boundary edges (only used in markov mode)
   // this is set from weighting_e[0] when edges is empty and weighting_e has size 1
   double _weighting_boundary = 0.0;
+
+  // active lattice spacing during one voxel-mode simplification run.
+  // zero means ordinary continuous simplification.
+  double _active_voxel_size = 0.0;
 
   /* update boundary edge weightings (for markov mode)
      boundary edge: an edge that is adjacent to exactly one face (i.e., has exactly one face parent)
@@ -788,6 +802,13 @@ class SimplicialComplex : noncopyable {
       delta_p *= 0.5;
     }
 
+    // In voxel mode, re-snap delta_p to exact grid multiples to eliminate
+    // floating-point drift that would break S1==S2 idempotency.
+    if (_active_voxel_size > 0.0) {
+      for (int d = 0; d < 3; ++d)
+        delta_p[d] = std::llround(delta_p[d] / _active_voxel_size) * _active_voxel_size;
+    }
+
     // source simplex (in the form of vertex ids) ---> topological label
     std::vector<TopoRecord> topo_record_lst;
 
@@ -807,7 +828,7 @@ class SimplicialComplex : noncopyable {
           vid = vsid;
         }
       }
-      topo_record_lst.push_back({v_ids, label});
+      topo_record_lst.push_back({v_ids, label, s->getDim(), s->getId()});
     };
 
     // handle point
@@ -898,10 +919,28 @@ class SimplicialComplex : noncopyable {
   /* evaluate the cost of edge contraction between two vertices (double precision)
    */
   std::pair<double, double> compute_contraction_cost_and_location(Simplex v0, Simplex v1) {
-    assert(v0 && v1);
+    assertx(v0 && v1);
     const Pointd& p0 = v0->getPosition();
     const Pointd& p1 = v1->getPosition();
     Pointd mid = 0.5 * (p0 + p1);
+    const double voxel_size = _active_voxel_size;
+    constexpr double k_voxel_tolerance = 1e-12;
+
+    auto is_on_voxel_grid = [voxel_size, k_voxel_tolerance](const Pointd& p) {
+      if (voxel_size <= 0.0) return true;
+      for (int d : {0, 1, 2}) {
+        double q = std::llround(p[d] / voxel_size) * voxel_size;
+        if (std::abs(p[d] - q) > k_voxel_tolerance * std::max(1.0, std::abs(p[d]))) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    if (voxel_size > 0.0) {
+      assertx(is_on_voxel_grid(p0));
+      assertx(is_on_voxel_grid(p1));
+    }
 
     // fused quadric (double precision)
     Matrix3d A = {v0->_A[0] + v1->_A[0], v0->_A[1] + v1->_A[1], v0->_A[2] + v1->_A[2]};
@@ -918,21 +957,24 @@ class SimplicialComplex : noncopyable {
       return std::max(val, 0.0);
     };
 
-    // evaluate cost at three points, take the one with minimum cost
+    // evaluate cost at three points, take the one with minimum cost.
+    // In voxel mode we only accept an exact on-grid midpoint here, because the
+    // split record format can reconstruct endpoints losslessly only for endpoint
+    // positions or a true midpoint.
     std::array<Pointd, 3> candidates = {p0, p1, mid};
-    int i_best = 2;
+    const bool allow_midpoint = voxel_size <= 0.0 || is_on_voxel_grid(mid);
+    int i_best = -1;
     double cost_min = std::numeric_limits<double>::max();
     for (int i : {2, 1, 0}) {
+      if (i == 2 && !allow_midpoint) continue;
       double cost = evaluate_cost(candidates[i]);
-      if (cost < cost_min) {
+      if (cost <= cost_min) {
         i_best = i;
         cost_min = cost;
       }
     }
+    assertx(i_best != -1);
 
-    // When both endpoints have equal cost (and are better than midpoint),
-    // use lexicographic position comparison for geometry-deterministic selection.
-    // This ensures the result is independent of vertex ID assignment.
     if (i_best == 0 || i_best == 1) {
       double cost_other = evaluate_cost(candidates[1 - i_best]);
       if (cost_other == cost_min) {
@@ -1001,7 +1043,10 @@ class SimplicialComplex : noncopyable {
   */
   std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>> perform_simplification(
       bool markov = false, double voxel_size = 0.0);
-#endif
+
+   private:
+    std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>> perform_simplification_impl(
+      bool markov);
 };
 
 inline Simplex SimplicialComplex::getSimplex(int dim, int id) const {

@@ -1,18 +1,19 @@
 // -*- C++ -*-  Copyright (c) Microsoft Corporation; see license.txt
 #include "G3dOGL/SimplicialComplex.h"
 
+#include <cstdint>
+#include <deque>
 #include <iomanip>
 #include <map>
+#include <unordered_set>
 
 #include "libHh/RangeOp.h"  // compare()
 #include "libHh/Set.h"
 #include "libHh/Stack.h"  // also vec_contains()
 #include "libHh/StringOp.h"
 
-#ifdef BUILD_LIBPSC
 #include "G3dOGL/Contractor.hpp"
 #include "G3dOGL/SplitRecord.h"
-#endif
 
 namespace hh {
 
@@ -20,8 +21,234 @@ namespace {
 
 constexpr double k_tolerance = 1e-12;                          // scalar attribute equality tolerance
 constexpr double k_undefined = static_cast<double>(BIGFLOAT);  // undefined scalar attributes
+constexpr double k_degenerate_face_eps = 1e-15;
 HH_STAT(Sarea_dropped);
 HH_STAT(Sarea_moved);
+
+struct GridPoint {
+  std::int64_t x;
+  std::int64_t y;
+  std::int64_t z;
+
+  bool operator==(const GridPoint& other) const { return x == other.x && y == other.y && z == other.z; }
+};
+
+struct GridPointHash {
+  std::size_t operator()(const GridPoint& p) const {
+    std::size_t h1 = std::hash<std::int64_t>{}(p.x);
+    std::size_t h2 = std::hash<std::int64_t>{}(p.y);
+    std::size_t h3 = std::hash<std::int64_t>{}(p.z);
+    std::size_t h = h1;
+    h ^= h2 + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= h3 + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct GridPointLess {
+  bool operator()(const GridPoint& a, const GridPoint& b) const {
+    if (a.x != b.x) return a.x < b.x;
+    if (a.y != b.y) return a.y < b.y;
+    return a.z < b.z;
+  }
+};
+
+// VertexVoxelInfo is no longer needed; vertices that collide on the grid
+// are merged rather than displaced to nearby cells.
+
+double squared_distance(const Pointd& a, const Pointd& b) {
+  const Pointd diff = a - b;
+  return mag2(diff);
+}
+
+Pointd zero_point() { return Pointd(0.0, 0.0, 0.0); }
+
+std::int64_t llround_grid(double value) { return static_cast<std::int64_t>(std::llround(value)); }
+
+GridPoint snap_point_to_grid(const Pointd& p, double voxel_size) {
+  return {llround_grid(p[0] / voxel_size), llround_grid(p[1] / voxel_size), llround_grid(p[2] / voxel_size)};
+}
+
+Pointd grid_point_to_position(const GridPoint& p, double voxel_size) {
+  return Pointd(static_cast<double>(p.x) * voxel_size, static_cast<double>(p.y) * voxel_size,
+                static_cast<double>(p.z) * voxel_size);
+}
+
+bool is_on_voxel_grid(const Pointd& p, double voxel_size) {
+  if (voxel_size <= 0.0) return true;
+  for (int d : {0, 1, 2}) {
+    double snapped = std::llround(p[d] / voxel_size) * voxel_size;
+    if (std::abs(p[d] - snapped) > k_tolerance * std::max(1.0, std::abs(p[d]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void copy_simplex_metadata(Simplex src, Simplex dst) {
+  dst->setVAttribute(src->getVAttribute());
+  dst->setArea(src->getArea());
+  if (src->get_string()) dst->set_string(src->get_string());
+  dst->_subtree_depth = src->_subtree_depth;
+  dst->_subtree_size = src->_subtree_size;
+  dst->_weighting_quadric = src->_weighting_quadric;
+  dst->_component_id = src->_component_id;
+  dst->_voxel_displaced = src->_voxel_displaced;
+}
+
+// Build a canonical copy of `src` where all vertices are snapped to the voxel
+// grid.  When multiple source vertices snap to the same grid cell they are
+// **merged** into a single canonical vertex (the one closest to the grid-cell
+// center).  Edges and faces are remapped accordingly; self-loop edges (both
+// endpoints merge to the same vertex) and degenerate faces (two or more
+// vertices coincide after merging) are dropped.  Duplicate edges/faces that
+// arise from the many-to-one vertex mapping are also deduplicated.
+//
+// This is idempotent: if the source mesh already has each vertex at a unique
+// grid point, the output is structurally identical to the input (modulo
+// canonical ID renumbering).
+void build_voxel_canonical_copy(const SimplicialComplex& src, double voxel_size, SimplicialComplex& dst) {
+  dst.clear();
+  dst._weighting_topo = src._weighting_topo;
+  dst._weighting_balanced = src._weighting_balanced;
+  dst._alpha_balanced = src._alpha_balanced;
+  dst._balanced_depth = src._balanced_depth;
+  dst._ratio_degeneracy = src._ratio_degeneracy;
+  dst._weighting_boundary = src._weighting_boundary;
+
+  // -- step 1: snap every source vertex to the grid and bucket by grid point --
+
+  struct BucketVertex {
+    Simplex simplex;
+    Pointd original_position;
+  };
+
+  std::map<GridPoint, std::vector<BucketVertex>, GridPointLess> buckets;
+  for (auto v : src.ordered_simplices_dim(0)) {
+    GridPoint gp = snap_point_to_grid(v->getPosition(), voxel_size);
+    buckets[gp].push_back(BucketVertex{.simplex = v, .original_position = v->getPosition()});
+  }
+
+  // -- step 2: for each bucket choose one anchor; build old-id → new-id map --
+  //    anchor = vertex closest to grid-cell center (deterministic tie-break)
+
+  // Maps every source vertex id to the canonical new vertex id.
+  std::unordered_map<int, int> vertex_remap;
+  vertex_remap.reserve(src.ordered_simplices_dim(0).size() * 2);
+
+  // We will create one new vertex per bucket, in GridPointLess order.
+  for (auto& [gp, bv] : buckets) {
+    const Pointd grid_center = grid_point_to_position(gp, voxel_size);
+
+    // sort: closest to grid center first; then by original position; then by id
+    std::sort(bv.begin(), bv.end(), [&](const BucketVertex& a, const BucketVertex& b) {
+      const double da = squared_distance(a.original_position, grid_center);
+      const double db = squared_distance(b.original_position, grid_center);
+      if (da != db) return da < db;
+      const auto pa = std::make_tuple(a.original_position[0], a.original_position[1], a.original_position[2]);
+      const auto pb = std::make_tuple(b.original_position[0], b.original_position[1], b.original_position[2]);
+      if (pa != pb) return pa < pb;
+      return a.simplex->getId() < b.simplex->getId();
+    });
+
+    // Create one canonical vertex for this grid point.
+    Simplex new_vertex = dst.createSimplex(0);
+    new_vertex->setPosition(grid_center);
+    copy_simplex_metadata(bv.front().simplex, new_vertex);
+    new_vertex->_voxel_displaced = false;
+
+    // If the bucket has multiple source vertices, aggregate subtree stats.
+    if (bv.size() > 1) {
+      int total_size = 0;
+      int max_depth = 0;
+      for (const auto& v : bv) {
+        total_size += v.simplex->_subtree_size;
+        max_depth = std::max(max_depth, v.simplex->_subtree_depth);
+      }
+      new_vertex->_subtree_size = total_size;
+      new_vertex->_subtree_depth = max_depth;
+    }
+
+    const int new_id = new_vertex->getId();
+    for (const auto& v : bv) {
+      vertex_remap.emplace(v.simplex->getId(), new_id);
+    }
+  }
+
+  // -- step 3: remap edges, dropping self-loops and deduplicating --
+
+  struct CanonicalEdgeInfo {
+    Simplex simplex;
+    std::array<int, 2> canonical_verts;
+  };
+  std::vector<CanonicalEdgeInfo> canonical_edges;
+  canonical_edges.reserve(src.ordered_simplices_dim(1).size());
+  for (auto e : src.ordered_simplices_dim(1)) {
+    int v0 = vertex_remap.at(e->getChild(0)->getId());
+    int v1 = vertex_remap.at(e->getChild(1)->getId());
+    if (v0 == v1) continue;  // self-loop from merged vertices
+    std::array<int, 2> verts = {std::min(v0, v1), std::max(v0, v1)};
+    canonical_edges.push_back(CanonicalEdgeInfo{.simplex = e, .canonical_verts = verts});
+  }
+  // Sort by canonical vertex pair; for duplicates keep the one with smallest original id
+  std::sort(canonical_edges.begin(), canonical_edges.end(), [](const CanonicalEdgeInfo& a, const CanonicalEdgeInfo& b) {
+    if (a.canonical_verts != b.canonical_verts) return a.canonical_verts < b.canonical_verts;
+    return a.simplex->getId() < b.simplex->getId();
+  });
+
+  std::map<std::array<int, 2>, Simplex> edge_by_pair;
+  for (const auto& info : canonical_edges) {
+    if (edge_by_pair.count(info.canonical_verts)) continue;  // deduplicate
+    Simplex edge = dst.createSimplex(1);
+    Simplex v0 = dst.getSimplex(0, info.canonical_verts[0]);
+    Simplex v1 = dst.getSimplex(0, info.canonical_verts[1]);
+    edge->setChild(0, v0);
+    edge->setChild(1, v1);
+    v0->addParent(edge);
+    v1->addParent(edge);
+    copy_simplex_metadata(info.simplex, edge);
+    edge_by_pair.emplace(info.canonical_verts, edge);
+  }
+
+  // -- step 4: remap faces, dropping degenerate and deduplicating --
+
+  struct CanonicalFaceInfo {
+    Simplex simplex;
+    std::array<int, 3> canonical_verts;
+  };
+  std::vector<CanonicalFaceInfo> canonical_faces;
+  canonical_faces.reserve(src.ordered_simplices_dim(2).size());
+  for (auto f : src.ordered_simplices_dim(2)) {
+    auto verts = compute_defining_vertex_ids(f);
+    std::array<int, 3> mapped = {vertex_remap.at(verts[0]), vertex_remap.at(verts[1]), vertex_remap.at(verts[2])};
+    std::sort(mapped.begin(), mapped.end());
+    // skip degenerate faces (two or more vertices coincide after merge)
+    if (mapped[0] == mapped[1] || mapped[1] == mapped[2]) continue;
+    canonical_faces.push_back(CanonicalFaceInfo{.simplex = f, .canonical_verts = mapped});
+  }
+  std::sort(canonical_faces.begin(), canonical_faces.end(), [](const CanonicalFaceInfo& a, const CanonicalFaceInfo& b) {
+    if (a.canonical_verts != b.canonical_verts) return a.canonical_verts < b.canonical_verts;
+    return a.simplex->getId() < b.simplex->getId();
+  });
+
+  std::set<std::array<int, 3>> seen_faces;
+  for (const auto& info : canonical_faces) {
+    if (!seen_faces.insert(info.canonical_verts).second) continue;  // deduplicate
+    // Ensure all required edges exist (merging can create faces whose edges
+    // were self-loops and thus dropped; skip such faces).
+    std::array<int, 2> e01 = {info.canonical_verts[0], info.canonical_verts[1]};
+    std::array<int, 2> e02 = {info.canonical_verts[0], info.canonical_verts[2]};
+    std::array<int, 2> e12 = {info.canonical_verts[1], info.canonical_verts[2]};
+    if (!edge_by_pair.count(e01) || !edge_by_pair.count(e02) || !edge_by_pair.count(e12)) continue;
+    Simplex face = dst.createSimplex(2);
+    std::array<Simplex, 3> child_edges = {edge_by_pair.at(e01), edge_by_pair.at(e02), edge_by_pair.at(e12)};
+    for (int i : {0, 1, 2}) {
+      face->setChild(i, child_edges[i]);
+      child_edges[i]->addParent(face);
+    }
+    copy_simplex_metadata(info.simplex, face);
+  }
+}
 
 }  // namespace
 
@@ -789,108 +1016,6 @@ int SimplicialComplex::compare_normal(const GMesh& mesh, Corner c1, Corner c2) {
   return compare(n1, n2, k_tolerance);
 }
 
-void SimplicialComplex::readGMesh(std::istream& is) {
-  GMesh mesh;
-  mesh.read(is);
-  Simplex s0, s1, s2;
-  Map<Vertex, Simplex> v2s0;
-  Map<Edge, Simplex> e2s1;
-
-  string str;
-  for (Vertex v : mesh.vertices()) {
-    s0 = createSimplex(0, mesh.vertex_id(v));
-    v2s0.enter(v, s0);
-    // no children
-    // parent updated later when its created
-    const Point& pt = mesh.point(v);
-    s0->setPosition(Pointd(pt[0], pt[1], pt[2]));
-
-    // compute normals
-    Vnors vnors(mesh, v);
-
-    for (Corner c : mesh.corners(v)) {
-      Vector nor = vnors.get_nor(mesh.corner_face(c));
-
-      // Normalize normals if necessary.
-      assertx(nor[0] != k_undefined);  // normals always present
-      // Always renormalize normal.
-      if (!nor.normalize()) {
-        Warning("Normal is zero, setting arbitrarily to (1, 0, 0)");
-        nor = Vector(1.f, 0.f, 0.f);
-      }
-
-      mesh.update_string(c, "normal", csform_vec(str, nor));
-    }
-  }
-
-  for (Edge e : mesh.edges()) {
-    s1 = createSimplex(1);
-    e2s1.enter(e, s1);
-    // update children
-    s1->setChild(0, v2s0.get(mesh.vertex1(e)));
-    s1->setChild(1, v2s0.get(mesh.vertex2(e)));
-
-    // update parent of the children
-    s1->getChild(0)->addParent(s1);
-    s1->getChild(1)->addParent(s1);
-  }
-
-  Map<Face, Simplex> mfs;
-  for (Face f : mesh.faces()) {
-    s2 = createSimplex(2, mesh.face_id(f));
-    mfs.enter(f, s2);
-    // update children
-    int ind = 0;
-    for (Edge e : mesh.edges(f)) {
-      assertx(ind < 3);
-      s2->setChild(ind, e2s1.get(e));
-      ind++;
-    }
-
-    // update parent of the children
-    for (Simplex c : s2->children()) c->addParent(s2);
-  }
-
-  {
-    // If attrid keys present in input file, use them, else add new ones after the maximum found.
-    // This is useful if output of simplification is re-simplified.
-    // See identical code in MeshSimplify.cpp
-    Set<string> hashstring;
-    Map<Simplex, const string*> mssrep;
-    for (Face f : mesh.faces()) {
-      assertx(mesh.is_triangle(f));
-      if (!mesh.get_string(f)) mesh.set_string(f, "");
-      bool is_new;
-      const string& srep = hashstring.enter(mesh.get_string(f), is_new);
-      mssrep.enter(mfs.get(f), &srep);
-    }
-    Map<const string*, int> msrepattrid;
-    for (const string& srep : hashstring) {
-      const char* smat = GMesh::string_key(str, srep.c_str(), "attrid");
-      if (!smat) continue;
-      int attrid = to_int(smat);
-      assertx(attrid >= 0);
-      _material_strings.access(attrid);
-      assertx(_material_strings[attrid] == "");  // no duplicate attrid's
-      _material_strings[attrid] = srep;
-      msrepattrid.enter(&srep, attrid);
-    }
-    showdf("Found %d materials with existing attrid (%d empty)\n",  //
-           msrepattrid.num(), _material_strings.num() - msrepattrid.num());
-    int nfirst = msrepattrid.num();
-    // string str;
-    for (const string& srep : hashstring) {
-      if (GMesh::string_has_key(srep.c_str(), "attrid")) continue;  // handled above
-      int attrid = _material_strings.add(1);
-      _material_strings[attrid] = GMesh::string_update(srep, "attrid", csform(str, "%d", attrid));
-      msrepattrid.enter(&srep, attrid);
-    }
-    showdf("Found %d materials without existing attrid\n", _material_strings.num() - nfirst);
-    showdf("nmaterials=%d\n", _material_strings.num());
-    for (Simplex s3 : this->simplices_dim(2)) s3->setVAttribute(msrepattrid.get(mssrep.get(s3)));
-  }
-}
-
 // Allocates new simplex of dimension dim and inserts into simplicial complex.
 // Note: children and parents if any must be specified later.
 Simplex SimplicialComplex::createSimplex(int dim) {
@@ -916,13 +1041,22 @@ Simplex SimplicialComplex::createSimplex(int dim, int id) {
   return s;
 }
 
-#ifdef BUILD_LIBPSC
+std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>>
+SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
+  if (voxel_size > 0.0) {
+    SimplicialComplex canonical_mesh;
+    build_voxel_canonical_copy(*this, voxel_size, canonical_mesh);
+    canonical_mesh._active_voxel_size = voxel_size;
+    return canonical_mesh.perform_simplification_impl(markov);
+  }
+
+  _active_voxel_size = 0.0;
+  return perform_simplification_impl(markov);
+}
 
 /* perform simplicial complex simplification, until a single vertex */
 std::tuple<std::array<double, 3>, std::vector<py::dict>, std::vector<double>>
-SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
-  (void)voxel_size;
-
+SimplicialComplex::perform_simplification_impl(bool markov) {
   // update "_total_initial_vertices"
   _total_initial_vertices = 0;
   for (auto v : ordered_simplices_dim(0)) {
@@ -997,17 +1131,17 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
       Pointd v0 = get_v_pos(v012[0], replace);
       Pointd v1 = get_v_pos(v012[1], replace);
       Pointd v2 = get_v_pos(v012[2], replace);
-      Pointd u = v1 - v0;
-      Pointd v = v2 - v0;
-      Pointd normals = cross(u, v);
-      normals.normalize();
-      return normals;
+      if (is_degenerate_triangle_(v0, v1, v2)) return zero_point();
+      Pointd normal = cross(v1 - v0, v2 - v0);
+      normal.normalize();
+      return normal;
     };
 
     // compute original face normals
     for (Simplex f : affected_faces) {
       Pointd nor_before = get_f_nor(f, false);
       Pointd nor_after = get_f_nor(f, true);
+      if (mag2(nor_before) == 0.0 || mag2(nor_after) == 0.0) continue;
       // detect flipped faces
       //   the threshold is from: https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification/blob/65df07dc54766e3ee480482f1c881a62767831cc/src.gl/Simplify.h#L219
       if (dot(nor_before, nor_after) < 0.2) {
@@ -1058,6 +1192,17 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
     }
     Pointd p_new = vt->getPosition() - delta_p;
 
+    // In voxel mode, re-snap delta_p and p_new to exact grid multiples to
+    // eliminate floating-point drift that would break S1==S2 idempotency.
+    if (_active_voxel_size > 0.0) {
+      for (int d = 0; d < 3; ++d) {
+        delta_p[d] = std::llround(delta_p[d] / _active_voxel_size) * _active_voxel_size;
+        p_new[d] = std::llround(p_new[d] / _active_voxel_size) * _active_voxel_size;
+      }
+      assertx(is_on_voxel_grid(vs->getPosition(), _active_voxel_size));
+      assertx(is_on_voxel_grid(vt->getPosition(), _active_voxel_size));
+    }
+
     // see if it will cause flipped faces
     constexpr double FP64_INF = std::numeric_limits<double>::max();
     if (cost < FP64_INF && !is_valid_ecol(vsid, vtid, p_new)) {
@@ -1073,6 +1218,9 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
 
     // update source position, because we will later unify and discard "vt"
     vs->setPosition(p_new);
+    if (_active_voxel_size > 0.0) {
+      vs->_voxel_displaced = vs->_voxel_displaced || vt->_voxel_displaced || w_p0 == 0.5;
+    }
 
     // perform edge collapse
     contractor.merge(vsid, vtid);
@@ -1112,7 +1260,7 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
 
     // apply "remap" and update "topo_record"
     constexpr int INT_MAX_VAL = std::numeric_limits<int>::max();
-    for (auto& [defining_vertex_ids, label] : topo_record) {
+    for (auto& [defining_vertex_ids, label, dim, simplex_id] : topo_record) {
       for (auto& v : defining_vertex_ids) {
         if (v != INT_MAX_VAL) {
           v = remap.at(v);
@@ -1124,6 +1272,11 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
 
   // the starting location
   Pointd starting_point_ = getSimplex(0, start_v_idx)->getPosition();
+  if (_active_voxel_size > 0.0) {
+    // Re-snap to exact grid representation.
+    for (int d = 0; d < 3; ++d)
+      starting_point_[d] = std::llround(starting_point_[d] / _active_voxel_size) * _active_voxel_size;
+  }
   std::array<double, 3> starting_point{starting_point_[0], starting_point_[1], starting_point_[2]};
 
   // compute string code by reconstructing the simplicial complex
@@ -1154,14 +1307,28 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
     }
 
     // to find the topological label for the query simplex
+    using TopoKey = std::pair<int, DefiningVertIds>;
+    std::map<TopoKey, std::deque<int>> labels_by_key;
+    std::vector<const TopoRecord*> topo_records_sorted;
+    topo_records_sorted.reserve(topo_record_lst.size());
+    for (const auto& record : topo_record_lst) {
+      topo_records_sorted.push_back(&record);
+    }
+    std::sort(topo_records_sorted.begin(), topo_records_sorted.end(), [](const TopoRecord* a, const TopoRecord* b) {
+      if (a->dim != b->dim) return a->dim < b->dim;
+      return a->simplex_id < b->simplex_id;
+    });
+    for (const TopoRecord* record : topo_records_sorted) {
+      labels_by_key[{record->dim, record->defining_vertex_ids}].push_back(record->label);
+    }
+
     auto find_label = [&](Simplex s) {
-      auto v_ids = compute_defining_vertex_ids(s);
-      for (const auto& [defining_vertex_ids, label] : topo_record_lst) {
-        if (v_ids == defining_vertex_ids) {
-          return label;  // return the topological label
-        }
-      }
-      assertnever("should never reach here");
+      const TopoKey key{s->getDim(), compute_defining_vertex_ids(s)};
+      auto it = labels_by_key.find(key);
+      assertx(it != labels_by_key.end() && !it->second.empty());
+      const int label = it->second.front();
+      it->second.pop_front();
+      return label;
     };
 
     // compute the string code
@@ -1201,6 +1368,5 @@ SimplicialComplex::perform_simplification(bool markov, double voxel_size) {
   // output the starting location as well as the operation sequence
   return std::make_tuple(starting_point, vsplit_lst, cost_lst);
 }
-#endif
 
 }  // namespace hh
